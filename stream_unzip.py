@@ -2,6 +2,7 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import hashlib
 import zlib
 
 from Crypto.Cipher import AES
@@ -12,7 +13,8 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
+def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True,
+                 archive_identity=None, on_resume_point=None, resume_from=None):
     local_file_header_signature = b'PK\x03\x04'
     local_file_header_struct = Struct('<H2sHHHIIIHH')
     zip64_compressed_size = 0xFFFFFFFF
@@ -29,25 +31,94 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
     dd_struct_64 = Struct('<0sIQQ4s')
     dd_struct_64_with_sig = Struct('<4sIQQ4s')
 
+    resume_point_version = 1
+
+    def parse_resume_point(resume_point):
+        # A resume point is a plain dict of JSON-serializable values (no pickle), so callers can
+        # persist it however they like, e.g. as JSON next to a partially-downloaded archive
+        if not isinstance(resume_point, dict):
+            raise InvalidResumePointError()
+
+        try:
+            version = resume_point['version']
+            offset = resume_point['offset']
+            members_completed = resume_point['members_completed']
+            identity = resume_point['archive_identity']
+            prefix_sha256 = resume_point['prefix_sha256']
+        except KeyError:
+            raise InvalidResumePointError() from None
+
+        if version != resume_point_version:
+            raise InvalidResumePointError()
+
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise InvalidResumePointError()
+
+        if not isinstance(members_completed, int) or isinstance(members_completed, bool) or members_completed < 0:
+            raise InvalidResumePointError()
+
+        if prefix_sha256 is not None and not isinstance(prefix_sha256, str):
+            raise InvalidResumePointError()
+
+        return offset, members_completed, identity
+
+    if resume_from is None:
+        base_offset = 0
+        base_members_completed = 0
+    else:
+        base_offset, base_members_completed, base_identity = parse_resume_point(resume_from)
+        # The caller proves the archive is the same one the resume point was exported from by
+        # re-supplying the identity they originally attached to it, e.g. an ETag or URL+size
+        if archive_identity is None or archive_identity != base_identity:
+            raise ResumeIdentityError()
+
+    if on_resume_point is not None and archive_identity is None:
+        # A resume point without identity cannot be safely matched to an archive later
+        raise ResumeIdentityError()
+
     def next_or_truncated_error(it):
         try:
             return next(it)
         except StopIteration:
             raise TruncatedDataError from None
 
-    def get_byte_readers(iterable):
+    def get_byte_readers(iterable, track_prefix_hash):
         # Return functions to return/"replace" bytes from/to the iterable
         # - _yield_all: yields chunks as they come up (often for a "body")
         # - _get_num: returns a single `bytes` of a given length
         # - _return_num_unused: puts a number of "unused" bytes "back", to be retrieved by a yield/get call
         # - _return_bytes_unused: return a bytes instance "back" into the stream, to be retrieved later
         # - _get_offset_from_start: get the zero-indexed offset from the start of the stream
+        # - _get_prefix_sha256: get the hex SHA-256 of all the bytes consumed so far, or None if
+        #   prefix hash tracking is disabled
 
         chunk = b''
         offset = 0
         offset_from_start = 0
         queue = list()  # Will typically have at most 1 element, so a list is fine
         it = iter(iterable)
+
+        # To be able to include a hash of the already-consumed archive bytes in resume points
+        # without buffering the whole prefix, consumed bytes are hashed incrementally. Since
+        # recently-consumed bytes can be "returned" unused (e.g. pre-read bytes of the next
+        # member, or unused bytes past the end of a compressed stream), a window of the most
+        # recently consumed bytes is kept unhashed so such returns can be subtracted again.
+        # Returns always happen immediately after the bytes were consumed, and are bounded by
+        # chunk_size (plus a few signature bytes), so the window only needs to be slightly
+        # larger than a single chunk
+        prefix_hasher = hashlib.sha256() if track_prefix_hash else None
+        pending_hash_bytes = bytearray()
+        hash_window = chunk_size + 64
+
+        def _track_hash(bytes_consumed):
+            pending_hash_bytes.extend(bytes_consumed)
+            if len(pending_hash_bytes) > hash_window:
+                num_to_hash = len(pending_hash_bytes) - hash_window
+                prefix_hasher.update(pending_hash_bytes[:num_to_hash])
+                del pending_hash_bytes[:num_to_hash]
+
+        def _untrack_hash(num):
+            del pending_hash_bytes[max(0, len(pending_hash_bytes) - num):]
 
         def _next():
             try:
@@ -65,7 +136,10 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
                 offset = offset + to_yield
                 num -= to_yield
                 offset_from_start += to_yield
-                yield chunk[offset - to_yield:offset]
+                yielded = chunk[offset - to_yield:offset]
+                if prefix_hasher is not None:
+                    _track_hash(yielded)
+                yield yielded
 
         def _yield_all():
             try:
@@ -80,6 +154,8 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             nonlocal offset, offset_from_start
             offset -= num_unused
             offset_from_start -= num_unused
+            if prefix_hasher is not None:
+                _untrack_hash(num_unused)
 
         def _return_bytes_unused(bytes_unused):
             nonlocal chunk, offset, offset_from_start
@@ -87,11 +163,20 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             chunk = bytes_unused
             offset = 0
             offset_from_start -= len(bytes_unused)
+            if prefix_hasher is not None:
+                _untrack_hash(len(bytes_unused))
 
         def _get_offset_from_start():
             return offset_from_start
 
-        return _yield_all, _get_num, _return_num_unused, _return_bytes_unused, _get_offset_from_start
+        def _get_prefix_sha256():
+            if prefix_hasher is None:
+                return None
+            hasher = prefix_hasher.copy()
+            hasher.update(pending_hash_bytes)
+            return hasher.hexdigest()
+
+        return _yield_all, _get_num, _return_num_unused, _return_bytes_unused, _get_offset_from_start, _get_prefix_sha256
 
     def get_decompressor_none(num_bytes):
         num_decompressed = 0
@@ -445,12 +530,32 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
         return file_name, uncompressed_size, checked_bytes
 
     def all():
-        yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = get_byte_readers(zipfile_chunks)
+        # The prefix hash can only be tracked when the stream starts at the beginning of the
+        # archive - when resuming, the bytes before the resume offset are not seen
+        yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, get_prefix_sha256 = \
+            get_byte_readers(zipfile_chunks, track_prefix_hash=on_resume_point is not None and resume_from is None)
+
+        members_completed = base_members_completed
 
         while True:
             signature = get_num(len(local_file_header_signature))
             if signature == local_file_header_signature:
                 yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start)
+                members_completed += 1
+
+                if on_resume_point is not None:
+                    # The member, including any data descriptor, has been fully consumed and
+                    # its CRC-32 and sizes verified, so the offset is now exactly on a member
+                    # boundary. Bytes of the next member that happen to have been pre-read
+                    # from the source are not counted in the offset (nor in the prefix hash),
+                    # so the caller can safely re-supply the archive from this offset later
+                    on_resume_point({
+                        'version': resume_point_version,
+                        'offset': base_offset + get_offset_from_start(),
+                        'members_completed': members_completed,
+                        'archive_identity': archive_identity,
+                        'prefix_sha256': get_prefix_sha256(),
+                    })
             elif signature in (central_directory_signature, end_of_central_directory_signature):
                 for _ in yield_all():
                     pass
@@ -544,6 +649,15 @@ class UnsupportedZip64Error(UnsupportedFeatureError):
     pass
 
 class TruncatedDataError(DataError):
+    pass
+
+class ResumeError(UnzipValueError):
+    pass
+
+class InvalidResumePointError(ResumeError):
+    pass
+
+class ResumeIdentityError(ResumeError):
     pass
 
 class UnexpectedSignatureError(DataError):

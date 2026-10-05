@@ -43,3 +43,40 @@ for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), passw
 ```
 
 The file name and file size are extracted as reported from the file. If you don't trust the creator of the ZIP file, these should be treated as untrusted input.
+
+
+## Resuming interrupted downloads
+
+If the stream of ZIP bytes can be interrupted, for example by a network failure while downloading a large archive, a resume point can be exported after each member has been fully read and verified. A resume point is a plain dict of JSON-serializable values, and contains the exact offset in the compressed stream of the member boundary, the archive identity supplied by the caller, and the state needed to continue: the number of members completed and a SHA-256 hash of all the archive bytes before the boundary. Compressor state is never saved, and resume points are only ever exported on member boundaries - never in the middle of a file body, and never before a data descriptor has completed.
+
+```python
+resume_points = []
+
+for file_name, file_size, unzipped_chunks in stream_unzip(
+    zipped_chunks(),
+    archive_identity='https://www.example.com/my.zip; etag="abc123"',
+    on_resume_point=resume_points.append,
+):
+    for chunk in unzipped_chunks:
+        print(chunk)
+```
+
+To resume, the caller supplies an iterable that yields the bytes of the same archive starting exactly at the saved offset, the resume point itself, and the same archive identity to prove the bytes are from the original archive. If the identity does not match the one in the resume point, `ResumeIdentityError` is raised; a malformed resume point raises `InvalidResumePointError`.
+
+```python
+resume_point = resume_points[-1]
+
+def remaining_chunks():
+    with httpx.stream('GET', 'https://www.example.com/my.zip', headers={'Range': f'bytes={resume_point["offset"]}-'}) as r:
+        yield from r.iter_bytes(chunk_size=65536)
+
+for file_name, file_size, unzipped_chunks in stream_unzip(
+    remaining_chunks(),
+    archive_identity='https://www.example.com/my.zip; etag="abc123"',
+    resume_from=resume_point,
+):
+    for chunk in unzipped_chunks:
+        print(chunk)
+```
+
+Exporting resume points requires an `archive_identity`, and raises `ResumeIdentityError` without one. Resume points exported by a resumed run keep offsets absolute to the start of the original archive and continue the member count, but their `prefix_sha256` is `None` since the bytes before the resume offset are not seen again.

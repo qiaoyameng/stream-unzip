@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import itertools
 import io
+import json
 import platform
 import unittest
 import uuid
@@ -23,6 +25,8 @@ from stream_unzip import (
     IncorrectZipCryptoPasswordError,
     IncorrectAESPasswordError,
     DeflateError,
+    InvalidResumePointError,
+    ResumeIdentityError,
 )
 
 
@@ -747,6 +751,184 @@ class TestStreamUnzip(unittest.TestCase):
 
         with self.assertRaises(CRC32IntegrityError):
             for name, size, chunks in stream_unzip(yield_input()):
+                for chunk in chunks:
+                    pass
+
+    def make_resume_test_zip(self, contents, use_data_descriptors):
+        class Unseekable(io.BytesIO):
+            def seekable(self):
+                return False
+
+            def seek(self, *args, **kwargs):
+                raise io.UnsupportedOperation()
+
+        file = Unseekable() if use_data_descriptors else io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, content in enumerate(contents):
+                zf.writestr('file_{}.txt'.format(i), content)
+        return file.getvalue()
+
+    def test_resume_points_and_resume(self):
+        rnd = random.Random()
+        rnd.seed(3)
+
+        contents = [
+            b'',
+            b'short',
+            b''.join(uuid.UUID(int=rnd.getrandbits(128), version=4).hex.encode() for _ in range(0, 3000)),
+            rnd.randbytes(150000),
+            b'end',
+        ]
+        identity = 'https://example.com/archive.zip; etag="abc123"'
+
+        def chunked(data, size):
+            for i in range(0, len(data), size):
+                yield data[i:i + size]
+
+        for use_data_descriptors in (False, True):
+            with self.subTest(use_data_descriptors=use_data_descriptors):
+                zip_bytes = self.make_resume_test_zip(contents, use_data_descriptors)
+
+                # A full run, collecting resume points. The input chunk size is deliberately
+                # not aligned to member boundaries, so chunks contain the tail of one member
+                # and the header of the next
+                points = []
+                files = [
+                    (name, size, b''.join(chunks))
+                    for name, size, chunks in stream_unzip(
+                        chunked(zip_bytes, 65521),
+                        archive_identity=identity,
+                        on_resume_point=points.append,
+                    )
+                ]
+                self.assertEqual([f[0] for f in files], [b'file_%d.txt' % i for i in range(len(contents))])
+                self.assertEqual([f[2] for f in files], contents)
+
+                # One resume point per member, each exactly on the boundary that follows the
+                # member (including its data descriptor), with no pre-read bytes lost
+                self.assertEqual(len(points), len(contents))
+                for i, point in enumerate(points):
+                    self.assertEqual(point['version'], 1)
+                    self.assertEqual(point['members_completed'], i + 1)
+                    self.assertEqual(point['archive_identity'], identity)
+                    self.assertIn(zip_bytes[point['offset']:point['offset'] + 4], (b'PK\x03\x04', b'PK\x01\x02'))
+                    self.assertEqual(point['prefix_sha256'], hashlib.sha256(zip_bytes[:point['offset']]).hexdigest())
+
+                # Resume points must not depend on pickle - they survive a JSON round trip
+                points = [json.loads(json.dumps(point)) for point in points]
+
+                # Interrupt after each member in turn, then rebuild the remaining output from
+                # the last resume point, using a different chunk size for the resumed source
+                for num_completed in range(1, len(contents) + 1):
+                    with self.subTest(num_completed=num_completed):
+                        interrupted_points = []
+                        received = []
+                        output = stream_unzip(
+                            chunked(zip_bytes, 65521),
+                            archive_identity=identity,
+                            on_resume_point=interrupted_points.append,
+                        )
+                        for name, size, chunks in output:
+                            if len(received) == num_completed:
+                                # The network drops partway through this member
+                                for chunk in chunks:
+                                    break
+                                break
+                            received.append((name, size, b''.join(chunks)))
+                        output.close()
+
+                        # No resume point is exported for the member whose data descriptor
+                        # (or body) had not completed when the interruption happened
+                        self.assertEqual(interrupted_points, points[:num_completed])
+
+                        point = interrupted_points[-1]
+                        resumed_points = []
+                        remaining = [
+                            (name, size, b''.join(chunks))
+                            for name, size, chunks in stream_unzip(
+                                chunked(zip_bytes[point['offset']:], 4099),
+                                archive_identity=identity,
+                                on_resume_point=resumed_points.append,
+                                resume_from=point,
+                            )
+                        ]
+
+                        # The remaining output and its (internally verified) contents match
+                        # the full run, and chained resume points keep absolute offsets and
+                        # a cumulative member count
+                        self.assertEqual(received + remaining, files)
+                        self.assertEqual(len(resumed_points), len(contents) - num_completed)
+                        for j, resumed_point in enumerate(resumed_points):
+                            self.assertEqual(resumed_point['members_completed'], num_completed + j + 1)
+                            self.assertEqual(resumed_point['offset'], points[num_completed + j]['offset'])
+                            self.assertEqual(resumed_point['archive_identity'], identity)
+                            self.assertIsNone(resumed_point['prefix_sha256'])
+
+    def test_resume_point_export_requires_identity(self):
+        zip_bytes = self.make_resume_test_zip([b'a', b'b'], use_data_descriptors=False)
+
+        points = []
+        with self.assertRaises(ResumeIdentityError):
+            for name, size, chunks in stream_unzip([zip_bytes], on_resume_point=points.append):
+                for chunk in chunks:
+                    pass
+        self.assertEqual(points, [])
+
+    def test_resume_identity_mismatch(self):
+        zip_bytes = self.make_resume_test_zip([b'a', b'b'], use_data_descriptors=False)
+
+        points = []
+        for name, size, chunks in stream_unzip([zip_bytes], archive_identity='right', on_resume_point=points.append):
+            for chunk in chunks:
+                pass
+
+        with self.assertRaises(ResumeIdentityError):
+            for name, size, chunks in stream_unzip([zip_bytes[points[0]['offset']:]], resume_from=points[0]):
+                for chunk in chunks:
+                    pass
+
+        with self.assertRaises(ResumeIdentityError):
+            for name, size, chunks in stream_unzip([zip_bytes[points[0]['offset']:]], archive_identity='wrong', resume_from=points[0]):
+                for chunk in chunks:
+                    pass
+
+    def test_invalid_resume_points(self):
+        zip_bytes = self.make_resume_test_zip([b'a', b'b'], use_data_descriptors=False)
+
+        points = []
+        for name, size, chunks in stream_unzip([zip_bytes], archive_identity='id', on_resume_point=points.append):
+            for chunk in chunks:
+                pass
+        point = points[0]
+
+        invalid_points = [
+            'not-a-dict',
+            {k: v for k, v in point.items() if k != 'offset'},
+            dict(point, version=2),
+            dict(point, offset=-1),
+            dict(point, offset='0'),
+            dict(point, members_completed=-1),
+            dict(point, prefix_sha256=123),
+        ]
+        for invalid_point in invalid_points:
+            with self.subTest(invalid_point=invalid_point):
+                with self.assertRaises(InvalidResumePointError):
+                    for name, size, chunks in stream_unzip([zip_bytes], archive_identity='id', resume_from=invalid_point):
+                        for chunk in chunks:
+                            pass
+
+    def test_resume_from_wrong_offset_fails(self):
+        zip_bytes = self.make_resume_test_zip([b'a' * 1000, b'b' * 1000], use_data_descriptors=True)
+
+        points = []
+        for name, size, chunks in stream_unzip([zip_bytes], archive_identity='id', on_resume_point=points.append):
+            for chunk in chunks:
+                pass
+
+        # A source that does not start exactly on the saved boundary is rejected while
+        # parsing, since the expected signature is not there
+        with self.assertRaises(UnexpectedSignatureError):
+            for name, size, chunks in stream_unzip([zip_bytes[points[0]['offset'] + 1:]], archive_identity='id', resume_from=points[0]):
                 for chunk in chunks:
                     pass
 
