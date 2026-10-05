@@ -43,3 +43,21 @@ for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), passw
 ```
 
 The file name and file size are extracted as reported from the file. If you don't trust the creator of the ZIP file, these should be treated as untrusted input.
+
+
+## Structured member names
+
+By default, member names are yielded as the raw bytes in the ZIP file. Pass `structured_names=True` to receive a `MemberName` instead, without changing the raw bytes:
+
+- `raw_name` is the name exactly as stored.
+- `text` is the interpretation selected by the decoder, or `None` if no safe interpretation is available.
+- `basis` is one of `cp437`, `utf-8-flag`, `unicode-path-extra`, or `raw-bytes`.
+- `status` is `accepted` or `preserved`.
+- `issues` contains structured reasons when a name is rejected or preserved.
+- `normalized_key` is only for detecting collisions; the member name itself is not normalized, path-stripped, or case-folded.
+
+Names are interpreted according to the UTF-8 general-purpose bit and Info-ZIP Unicode Path extra field (`0x7075`). Unicode Path data is only used when its version, CRC of the raw name, and UTF-8 encoding are valid. Conflicting extra fields, duplicate Unicode Path extra fields, and malformed extra data are explicitly reported.
+
+`invalid_name_policy='strict'` (the default) raises `InvalidMemberNameError` for these metadata errors. Use `invalid_name_policy='preserve'` to retain the standard name from the local header instead; invalid raw UTF-8 has `text=None` and `raw_name` remains available. Invalid bytes are never ignored or silently merged into another name.
+
+`normalized_key` is hashable and suitable only for an application-maintained set of previously seen member names. It must not be used to construct local file paths; stream-unzip does not write members to the filesystem.

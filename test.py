@@ -6,10 +6,14 @@ import unittest
 import uuid
 import random
 import zipfile
+import zlib
+from struct import pack
 
 from stream_unzip import (
     async_stream_unzip,
     stream_unzip,
+    MemberName,
+    InvalidMemberNameError,
     UnfinishedIterationError,
     TruncatedDataError,
     UnsupportedFlagsError,
@@ -26,7 +30,234 @@ from stream_unzip import (
 )
 
 
+def local_file_header(raw_name, content=b'', extra=b'', flags=0):
+    return pack(
+        '<4sHHHHHIIIHH',
+        b'PK\x03\x04', 20, flags, 0, 0, 0,
+        zlib.crc32(content) & 0xFFFFFFFF,
+        len(content), len(content), len(raw_name), len(extra),
+    ) + raw_name + extra + content
+
+
+def unicode_path_extra(unicode_name, raw_name, crc32=None):
+    if crc32 is None:
+        crc32 = zlib.crc32(raw_name) & 0xFFFFFFFF
+    data = b'\x01' + pack('<I', crc32) + unicode_name
+    return b'\x75\x70' + pack('<H', len(data)) + data
+
+
+def zip_from_local_headers(*headers):
+    return b''.join(headers) + b'PK\x05\x06'
+
+
 class TestStreamUnzip(unittest.TestCase):
+
+    def test_structured_names_accept_cp437_and_unicode_path_extra_collision(self):
+        cp437_name = b'caf\x82.txt'
+        raw_unicode_name = b'cafe_.txt'
+        unicode_name = 'cafe\u0301.txt'.encode('utf-8')
+        zip_bytes = zip_from_local_headers(
+            local_file_header(cp437_name, b'a'),
+            local_file_header(
+                raw_unicode_name, b'b',
+                unicode_path_extra(unicode_name, raw_unicode_name),
+            ),
+        )
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip([zip_bytes], structured_names=True)
+        ]
+
+        self.assertEqual([content for _, content in members], [b'a', b'b'])
+        cp437_member, unicode_member = (name for name, _ in members)
+        self.assertIsInstance(cp437_member, MemberName)
+        self.assertEqual(cp437_member.raw_name, cp437_name)
+        self.assertEqual(cp437_member.text, 'café.txt')
+        self.assertEqual(cp437_member.basis, 'cp437')
+        self.assertEqual(cp437_member.status, 'accepted')
+        self.assertEqual(cp437_member.issues, ())
+
+        self.assertEqual(unicode_member.raw_name, raw_unicode_name)
+        self.assertEqual(unicode_member.text, 'cafe\u0301.txt')
+        self.assertEqual(unicode_member.basis, 'unicode-path-extra')
+        self.assertEqual(unicode_member.status, 'accepted')
+        self.assertEqual(unicode_member.issues, ())
+        self.assertNotEqual(unicode_member.raw_name, cp437_member.raw_name)
+        self.assertNotEqual(unicode_member.text, cp437_member.text)
+        self.assertEqual(unicode_member.normalized_key, cp437_member.normalized_key)
+
+    def test_structured_names_strict_rejects_unicode_path_extra_crc_mismatch(self):
+        raw_name = b'broken.txt'
+        extra = unicode_path_extra(
+            b'fixed.txt', raw_name,
+            (zlib.crc32(raw_name) + 1) & 0xFFFFFFFF,
+        )
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            next(stream_unzip(
+                [zip_from_local_headers(local_file_header(raw_name, b'a', extra=extra))],
+                structured_names=True,
+            ))
+
+        self.assertEqual(cm.exception.issues[0].code, 'unicode-path-extra-crc-mismatch')
+        self.assertTrue(cm.exception.issues[0].rejected)
+
+    def test_structured_names_strict_rejects_unsupported_unicode_path_extra_version(self):
+        raw_name = b'version.txt'
+        data = b'\x02' + pack(
+            '<I', zlib.crc32(raw_name) & 0xFFFFFFFF,
+        ) + b'version.txt'
+        extra = b'\x75\x70' + pack('<H', len(data)) + data
+        zip_bytes = zip_from_local_headers(local_file_header(raw_name, b'a', extra=extra))
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            next(stream_unzip([zip_bytes], structured_names=True))
+        self.assertEqual(cm.exception.issues[0].code, 'unsupported-unicode-path-extra-version')
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip(
+                [zip_bytes], structured_names=True,
+                invalid_name_policy='preserve',
+            )
+        ]
+        name, content = members[0]
+        self.assertEqual(content, b'a')
+        self.assertEqual(name.text, 'version.txt')
+        self.assertEqual(name.basis, 'cp437')
+        self.assertEqual(name.status, 'preserved')
+
+    def test_structured_names_preserve_retains_raw_name_on_crc_mismatch(self):
+        raw_name = b'broken.txt'
+        extra = unicode_path_extra(
+            b'fixed.txt', raw_name,
+            (zlib.crc32(raw_name) + 1) & 0xFFFFFFFF,
+        )
+        zip_bytes = zip_from_local_headers(local_file_header(raw_name, b'a', extra=extra))
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip(
+                [zip_bytes], structured_names=True,
+                invalid_name_policy='preserve',
+            )
+        ]
+
+        name, content = members[0]
+        self.assertEqual(content, b'a')
+        self.assertEqual(name.raw_name, raw_name)
+        self.assertEqual(name.text, 'broken.txt')
+        self.assertEqual(name.basis, 'cp437')
+        self.assertEqual(name.status, 'preserved')
+        self.assertEqual(name.issues[0].code, 'unicode-path-extra-crc-mismatch')
+        self.assertTrue(name.issues[0].rejected)
+
+    def test_structured_names_strict_rejects_conflicting_and_duplicate_extra(self):
+        raw_name = b'name.txt'
+        conflicting_extra = unicode_path_extra(b'other.txt', raw_name)
+        duplicate_extra = (
+            unicode_path_extra(b'name.txt', raw_name) +
+            unicode_path_extra(b'name.txt', raw_name)
+        )
+        conflicting_extra_fields = (
+            unicode_path_extra(b'first.txt', raw_name) +
+            unicode_path_extra(b'second.txt', raw_name)
+        )
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            list(stream_unzip(
+                [zip_from_local_headers(local_file_header(
+                    raw_name, b'a', flags=0x0800, extra=conflicting_extra,
+                ))],
+                structured_names=True,
+            ))
+        self.assertEqual(cm.exception.issues[0].code, 'unicode-path-extra-with-utf-8-flag')
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip(
+                [zip_from_local_headers(local_file_header(
+                    raw_name, b'a', flags=0x0800, extra=conflicting_extra,
+                ))],
+                structured_names=True,
+                invalid_name_policy='preserve',
+            )
+        ]
+        name, content = members[0]
+        self.assertEqual(content, b'a')
+        self.assertEqual(name.text, 'name.txt')
+        self.assertEqual(name.basis, 'utf-8-flag')
+        self.assertEqual(name.status, 'preserved')
+        self.assertEqual(name.issues[0].code, 'unicode-path-extra-with-utf-8-flag')
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            list(stream_unzip(
+                [zip_from_local_headers(local_file_header(raw_name, b'a', extra=duplicate_extra))],
+                structured_names=True,
+            ))
+        self.assertEqual(cm.exception.issues[-1].code, 'duplicate-unicode-path-extra')
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            list(stream_unzip(
+                [zip_from_local_headers(local_file_header(
+                    raw_name, b'a', extra=conflicting_extra_fields,
+                ))],
+                structured_names=True,
+            ))
+        self.assertEqual(cm.exception.issues[-2].code, 'duplicate-unicode-path-extra')
+        self.assertEqual(cm.exception.issues[-1].code, 'conflicting-unicode-path-extra')
+
+    def test_structured_names_invalid_unicode_extra_utf8_policy(self):
+        raw_name = b'name.txt'
+        extra = b'\x75\x70' + pack('<H', 10) + b'\x01' + pack(
+            '<I', zlib.crc32(raw_name) & 0xFFFFFFFF,
+        ) + b'\xffname'
+        zip_bytes = zip_from_local_headers(local_file_header(raw_name, b'a', extra=extra))
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            next(stream_unzip([zip_bytes], structured_names=True))
+        self.assertEqual(cm.exception.issues[0].code, 'invalid-unicode-path-extra-encoding')
+        self.assertTrue(cm.exception.issues[0].rejected)
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip(
+                [zip_bytes], structured_names=True,
+                invalid_name_policy='preserve',
+            )
+        ]
+        name, content = members[0]
+        self.assertEqual(content, b'a')
+        self.assertEqual(name.raw_name, raw_name)
+        self.assertEqual(name.text, 'name.txt')
+        self.assertEqual(name.basis, 'cp437')
+        self.assertEqual(name.status, 'preserved')
+        self.assertEqual(name.issues[0].code, 'invalid-unicode-path-extra-encoding')
+
+    def test_structured_names_invalid_utf8_policy(self):
+        raw_name = b'bad-\xff-name.txt'
+        zip_bytes = zip_from_local_headers(local_file_header(raw_name, b'a', flags=0x0800))
+
+        with self.assertRaises(InvalidMemberNameError) as cm:
+            next(stream_unzip([zip_bytes], structured_names=True))
+        self.assertEqual(cm.exception.issues[0].code, 'invalid-utf-8-name-encoding')
+
+        members = [
+            (name, b''.join(chunks))
+            for name, _, chunks in stream_unzip(
+                [zip_bytes], structured_names=True,
+                invalid_name_policy='preserve',
+            )
+        ]
+        name, content = members[0]
+        self.assertEqual(content, b'a')
+        self.assertEqual(name.raw_name, raw_name)
+        self.assertIsNone(name.text)
+        self.assertEqual(name.basis, 'raw-bytes')
+        self.assertEqual(name.status, 'preserved')
+        self.assertEqual(name.normalized_key, ('raw', raw_name))
+        self.assertEqual(name.issues[0].code, 'invalid-utf-8-name-encoding')
 
     def test_methods_and_chunk_sizes(self):
         rnd = random.Random()

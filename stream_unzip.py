@@ -1,8 +1,10 @@
 from functools import partial
-from struct import Struct
 import asyncio
 import bz2
+import unicodedata
 import zlib
+from collections import namedtuple
+from struct import Struct
 
 from Crypto.Cipher import AES
 from Crypto.Hash import HMAC, SHA1
@@ -12,7 +14,192 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
+UNICODE_PATH_EXTRA_SIGNATURE = b'\x75\x70'
+
+MemberName = namedtuple('MemberName', (
+    'raw_name', 'text', 'basis', 'status', 'issues', 'normalized_key',
+))
+
+MemberNameIssue = namedtuple('MemberNameIssue', (
+    'code', 'message', 'source', 'rejected',
+))
+
+
+def _name_issue(code, message, source, rejected=False):
+    return MemberNameIssue(code, message, source, rejected)
+
+
+def _normalized_member_name_key(text, raw_name):
+    # This key is intentionally separate from the member name. It detects Unicode
+    # representations that should be considered the same without modifying paths.
+    if text is None:
+        return ('raw', raw_name)
+    normalized = unicodedata.normalize('NFC', text).casefold().encode('utf-8')
+    return ('text', normalized)
+
+
+def _parse_unicode_path_extra_fields(extra):
+    fields = []
+    malformed = False
+    offset = 0
+
+    while offset + 4 <= len(extra):
+        signature = extra[offset:offset + 2]
+        data_size = Struct('<H').unpack(extra[offset + 2:offset + 4])[0]
+        data_start = offset + 4
+        data_end = data_start + data_size
+
+        if data_end > len(extra):
+            return fields, True
+
+        if signature == UNICODE_PATH_EXTRA_SIGNATURE:
+            fields.append(extra[data_start:data_end])
+
+        offset = data_end
+
+    if offset != len(extra):
+        malformed = True
+
+    return fields, malformed
+
+
+def _resolve_member_name(raw_name, utf8_flag, extra, invalid_name_policy):
+    issues = []
+    unicode_fields, malformed_extra = _parse_unicode_path_extra_fields(extra)
+
+    if malformed_extra:
+        issues.append(_name_issue(
+            'malformed-extra-field',
+            'An extra field is truncated or has trailing bytes',
+            'extra-field',
+            rejected=True,
+        ))
+
+    valid_unicode_names = []
+    for unicode_field in unicode_fields:
+        field_issues = []
+
+        if len(unicode_field) < 5:
+            field_issues.append(_name_issue(
+                'truncated-unicode-path-extra',
+                'The Unicode Path extra field is shorter than 5 bytes',
+                'unicode-path-extra',
+                rejected=True,
+            ))
+        else:
+            version = unicode_field[0]
+            name_crc32 = Struct('<I').unpack(unicode_field[1:5])[0]
+            unicode_name_bytes = unicode_field[5:]
+
+            if version != 1:
+                field_issues.append(_name_issue(
+                    'unsupported-unicode-path-extra-version',
+                    'The Unicode Path extra field version is not 1',
+                    'unicode-path-extra',
+                    rejected=True,
+                ))
+
+            if name_crc32 != zlib.crc32(raw_name) & 0xFFFFFFFF:
+                field_issues.append(_name_issue(
+                    'unicode-path-extra-crc-mismatch',
+                    'The Unicode Path extra field CRC does not match the raw name',
+                    'unicode-path-extra',
+                    rejected=True,
+                ))
+
+            unicode_name = None
+            try:
+                unicode_name = unicode_name_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                field_issues.append(_name_issue(
+                    'invalid-unicode-path-extra-encoding',
+                    'The Unicode Path extra field is not valid UTF-8',
+                    'unicode-path-extra',
+                    rejected=True,
+                ))
+            else:
+                unicode_name = (unicode_name, unicode_name_bytes)
+
+            if isinstance(unicode_name, tuple) and not field_issues:
+                valid_unicode_names.append(unicode_name)
+
+        issues.extend(field_issues)
+
+    if len(unicode_fields) > 1:
+        issues.append(_name_issue(
+            'duplicate-unicode-path-extra',
+            'There is more than one Unicode Path extra field',
+            'unicode-path-extra',
+            rejected=True,
+        ))
+
+    if len({unicode_name for unicode_name, _ in valid_unicode_names}) > 1:
+        issues.append(_name_issue(
+            'conflicting-unicode-path-extra',
+            'The Unicode Path extra fields do not contain the same name',
+            'unicode-path-extra',
+            rejected=True,
+        ))
+
+    if utf8_flag:
+        if len(unicode_fields) and not malformed_extra:
+            issues.append(_name_issue(
+                'unicode-path-extra-with-utf-8-flag',
+                'The Unicode Path extra field must not be used with the UTF-8 name flag',
+                'unicode-path-extra',
+                rejected=True,
+            ))
+
+        try:
+            text = raw_name.decode('utf-8')
+        except UnicodeDecodeError:
+            issues.append(_name_issue(
+                'invalid-utf-8-name-encoding',
+                'The raw name is not valid UTF-8 despite the UTF-8 name flag being set',
+                'utf-8-flag',
+                rejected=True,
+            ))
+            if invalid_name_policy == 'strict':
+                raise InvalidMemberNameError(issues)
+            text = None
+            basis = 'raw-bytes'
+        else:
+            basis = 'utf-8-flag'
+
+        if issues and invalid_name_policy == 'strict':
+            raise InvalidMemberNameError(issues)
+
+        status = 'preserved' if issues else 'accepted'
+        return MemberName(
+            raw_name, text, basis, status, tuple(issues),
+            _normalized_member_name_key(text, raw_name),
+        )
+
+    if len(valid_unicode_names) == 1 and len(unicode_fields) == 1 and not malformed_extra:
+        status = 'accepted'
+        text = valid_unicode_names[0][0]
+        basis = 'unicode-path-extra'
+    else:
+        status = 'preserved' if issues else 'accepted'
+        text = raw_name.decode('cp437')
+        basis = 'cp437'
+
+    if issues and invalid_name_policy == 'strict':
+        raise InvalidMemberNameError(issues)
+
+    return MemberName(
+        raw_name, text, basis, status, tuple(issues),
+        _normalized_member_name_key(text, raw_name),
+    )
+
+
+def stream_unzip(
+    zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True,
+    structured_names=False, invalid_name_policy='strict',
+):
+    if invalid_name_policy not in ('strict', 'preserve'):
+        raise ValueError("invalid_name_policy must be 'strict' or 'preserve'")
+
     local_file_header_signature = b'PK\x03\x04'
     local_file_header_struct = Struct('<H2sHHHIIIHH')
     zip64_compressed_size = 0xFFFFFFFF
@@ -386,8 +573,15 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
         ):
             raise UnsupportedFlagsError(flag_bits)
 
-        file_name = get_num(file_name_len)
-        extra = dict(parse_extra(get_num(extra_field_len)))
+        raw_file_name = get_num(file_name_len)
+        extra_bytes = get_num(extra_field_len)
+        extra = dict(parse_extra(extra_bytes))
+        file_name = _resolve_member_name(
+            raw_file_name,
+            bool(flag_bits[11]),
+            extra_bytes,
+            invalid_name_policy,
+        ) if structured_names else raw_file_name
 
         is_weak_encrypted = flag_bits[0] and compression_raw != 99
         is_aes_encrypted = flag_bits[0] and compression_raw == 99
@@ -533,6 +727,13 @@ class BZ2Error(UncompressError):
 
 class UnsupportedFeatureError(DataError):
     pass
+
+class InvalidMemberNameError(DataError):
+
+    def __init__(self, issues):
+        self.issues = tuple(issues)
+        messages = '; '.join(issue.message for issue in self.issues)
+        super().__init__(messages)
 
 class UnsupportedFlagsError(UnsupportedFeatureError):
     pass
