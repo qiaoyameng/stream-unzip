@@ -22,3 +22,5 @@ In addition to being memory efficient, stream-unzip supports:
 - BZip2-compressed ZIPs.
 
 - An async interface (that uses threads under the hood).
+
+- Optional strict verification of the central directory at the end of the archive against the members that were streamed, with per-member receipts that are only confirmed once the archive tail has been read and checked.

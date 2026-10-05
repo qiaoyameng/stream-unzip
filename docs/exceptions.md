@@ -96,9 +96,37 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
 
                     The amount of compressed bytes of a member file did not match its metadata.
 
+                - **CentralDirectoryIntegrityError**
+
+                    Raised in strict mode when a central directory entry, or the end-of-central-directory record, disagrees with the member that was actually streamed.
+
+                    - **CentralDirectoryNameMismatchError**
+
+                    - **CentralDirectoryCompressionMethodMismatchError**
+
+                    - **CentralDirectoryFlagsMismatchError**
+
+                    - **CentralDirectoryCRC32MismatchError**
+
+                    - **CentralDirectoryCompressedSizeMismatchError**
+
+                    - **CentralDirectoryUncompressedSizeMismatchError**
+
+                    - **CentralDirectoryOffsetMismatchError**
+
+                    - **CentralDirectorySizeMismatchError**
+
+                    - **CentralDirectoryMemberCountError**
+
+                    - **CentralDirectoryMultiDiskError**
+
             - **TruncatedDataError**
 
                 The stream of bytes ended unexpectedly.
+
+            - **IncompleteArchiveError**
+
+                In strict mode, the archive ended without a complete central directory and end-of-central-directory record.
 
             - **UnexpectedSignatureError**
 

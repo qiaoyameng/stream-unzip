@@ -18,12 +18,25 @@ from stream_unzip import (
     UnexpectedSignatureError,
     HMACIntegrityError,
     CRC32IntegrityError,
+    CentralDirectoryIntegrityError,
+    CentralDirectoryCRC32MismatchError,
+    CentralDirectoryCompressedSizeMismatchError,
+    CentralDirectoryNameMismatchError,
+    CentralDirectoryOffsetMismatchError,
+    CentralDirectoryFlagsMismatchError,
+    CentralDirectoryMemberCountError,
+    IncompleteArchiveError,
+    MemberReceipt,
     MissingZipCryptoPasswordError,
     MissingAESPasswordError,
     IncorrectZipCryptoPasswordError,
     IncorrectAESPasswordError,
     DeflateError,
 )
+import struct
+import zlib
+
+import stream_unzip as stream_unzip_module
 
 
 class TestStreamUnzip(unittest.TestCase):
@@ -852,3 +865,270 @@ class TestStreamUnzip(unittest.TestCase):
         self.assertEqual(var.get(), 'set-from-outer')
         self.assertEqual(inner, 'set-from-outer')
         self.assertEqual(d.get()['key'], 'set-from-inner')
+
+    def test_strict_receipts_pending_until_archive_tail_checked(self):
+        def yield_input():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('first.txt', b'a' * 100000)
+                zf.writestr('second.txt', b'b')
+            zip_bytes = file.getvalue()
+            for i in range(0, len(zip_bytes), 100):
+                yield zip_bytes[i:i + 100]
+
+        receipts = []
+        for name, receipt, chunks in stream_unzip(yield_input(), strict=True):
+            self.assertIsInstance(receipt, MemberReceipt)
+            # While the member bytes are being streamed the archive's tail has not
+            # been read yet, so the member cannot be trusted
+            self.assertEqual(receipt.status, MemberReceipt.PENDING)
+            b''.join(chunks)
+            receipts.append(receipt)
+
+        self.assertTrue(all(receipt.is_confirmed for receipt in receipts))
+
+    def test_strict_members_confirm_with_data_descriptors(self):
+        def yield_input():
+            with open('fixtures/macos_10_14_5_multiple_files.zip', 'rb') as f:
+                yield f.read()
+
+        files = []
+        for name, receipt, chunks in stream_unzip(yield_input(), strict=True):
+            files.append((name, receipt.file_size, b''.join(chunks), receipt))
+
+        self.assertEqual(
+            [name for name, _, _, _ in files],
+            [b'first.txt', b'__MACOSX/', b'__MACOSX/._first.txt', b'second.txt', b'__MACOSX/._second.txt'],
+        )
+        self.assertTrue(all(receipt.is_confirmed for *_, receipt in files))
+        self.assertEqual([receipt.file_size for *_, receipt in files], [26, 0, 210, 27, 210])
+
+    def test_strict_empty_archive_is_confirmed(self):
+        def yield_input():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED):
+                pass
+            yield file.getvalue()
+
+        self.assertEqual(list(stream_unzip(yield_input(), strict=True)), [])
+
+    def test_strict_central_directory_crc_tampered_fails_even_though_member_crc_is_ok(self):
+        # The single member is streamed with a correct local-header CRC, but its
+        # central directory entry is tampered with: the archive as a whole is not valid
+        def yield_input():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('only.txt', b'the single file CRC is correct' * 10)
+            zip_bytes = bytearray(file.getvalue())
+            central_directory_offset = zip_bytes.find(b'PK\x01\x02')
+            zip_bytes[central_directory_offset + 16] ^= 0xFF
+            yield bytes(zip_bytes)
+
+        with self.assertRaises(CentralDirectoryCRC32MismatchError):
+            for name, receipt, chunks in stream_unzip(yield_input(), strict=True):
+                b''.join(chunks)
+                # The caller must not treat the single, CRC-correct member as proof
+                # that the whole archive can be trusted
+                self.assertFalse(receipt.is_confirmed)
+
+    def test_strict_central_directory_other_fields_tampered(self):
+        def zip_bytes():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('first.txt', b'first')
+                zf.writestr('second.txt', b'second body')
+            return bytearray(file.getvalue())
+
+        # Name of the first central directory entry
+        data = zip_bytes()
+        central_directory_offset = data.find(b'PK\x01\x02')
+        data[central_directory_offset + 46] ^= 0xFF
+        with self.assertRaises(CentralDirectoryNameMismatchError):
+            for name, receipt, chunks in stream_unzip(iter([bytes(data)]), strict=True):
+                b''.join(chunks)
+
+        # General purpose bit flag of the first central directory entry
+        data = zip_bytes()
+        data[central_directory_offset + 8] ^= 0x01
+        with self.assertRaises(CentralDirectoryFlagsMismatchError):
+            for name, receipt, chunks in stream_unzip(iter([bytes(data)]), strict=True):
+                b''.join(chunks)
+
+        # Compressed size of the second central directory entry
+        second_entry_offset = data.find(b'PK\x01\x02', central_directory_offset + 4)
+        data = zip_bytes()
+        second_entry_offset = data.find(b'PK\x01\x02', central_directory_offset + 4)
+        data[second_entry_offset + 20] ^= 0x01
+        with self.assertRaises(CentralDirectoryCompressedSizeMismatchError):
+            for name, receipt, chunks in stream_unzip(iter([bytes(data)]), strict=True):
+                b''.join(chunks)
+
+        # Local header offset of the first central directory entry
+        data = zip_bytes()
+        data[central_directory_offset + 42] ^= 0x01
+        with self.assertRaises(CentralDirectoryOffsetMismatchError):
+            for name, receipt, chunks in stream_unzip(iter([bytes(data)]), strict=True):
+                b''.join(chunks)
+
+    def test_strict_duplicate_names_matched_by_physical_position(self):
+        def yield_input():
+            file = io.BytesIO()
+            with warnings_zip(file) as zf:
+                zf.writestr('dup.txt', b'first content')
+                zf.writestr('dup.txt', b'second content')
+            yield file.getvalue()
+
+        files, receipts = [], []
+        for name, receipt, chunks in stream_unzip(yield_input(), strict=True):
+            files.append((name, b''.join(chunks)))
+            receipts.append(receipt)
+
+        self.assertEqual(files, [
+            (b'dup.txt', b'first content'),
+            (b'dup.txt', b'second content'),
+        ])
+        self.assertTrue(all(receipt.is_confirmed for receipt in receipts))
+
+    def test_strict_missing_central_directory_is_incomplete(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'content')
+        zip_bytes = file.getvalue()
+        cut = zip_bytes.find(b'PK\x01\x02')
+
+        with self.assertRaises(IncompleteArchiveError):
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes[:cut]]), strict=True):
+                b''.join(chunks)
+
+    def test_strict_missing_end_of_central_directory_is_incomplete(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'content')
+        zip_bytes = file.getvalue()
+        cut = zip_bytes.find(b'PK\x05\x06') + 10
+
+        with self.assertRaises(IncompleteArchiveError):
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes[:cut]]), strict=True):
+                b''.join(chunks)
+
+    def test_strict_member_body_truncation_is_not_completeness_error(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'x' * 100000)
+        zip_bytes = file.getvalue()
+        cut = zip_bytes.find(b'PK\x01\x02') - 5
+
+        with self.assertRaises(TruncatedDataError):
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes[:cut]]), strict=True):
+                b''.join(chunks)
+
+    def test_strict_member_count_mismatch_fails(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'first')
+        zip_bytes = bytearray(file.getvalue())
+        end_offset = zip_bytes.find(b'PK\x05\x06')
+        # Total entries in the end-of-central-directory record claims 2, there is 1
+        zip_bytes[end_offset + 10] = 2
+        zip_bytes[end_offset + 8] = 2
+
+        with self.assertRaises(CentralDirectoryMemberCountError):
+            for name, receipt, chunks in stream_unzip(iter([bytes(zip_bytes)]), strict=True):
+                b''.join(chunks)
+
+    def test_strict_zip64_extra_values_checked(self):
+        zip_bytes = self._make_zip64_archive()
+
+        files = [
+            (name, b''.join(chunks), receipt)
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes]), strict=True)
+        ]
+        self.assertEqual(files[0][0], b'a.txt')
+        self.assertEqual(files[0][1], b'zip64 payload ' * 100)
+        self.assertTrue(files[0][2].is_confirmed)
+
+        # A zip64 end-of-central-directory record must not be silently accepted when disabled
+        with self.assertRaises(UnsupportedZip64Error):
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes]), strict=True, allow_zip64=False):
+                b''.join(chunks)
+
+    def test_strict_spooled_member_index(self):
+        original_index = stream_unzip_module._SpooledMemberIndex
+        stream_unzip_module._SpooledMemberIndex = lambda *args, **kwargs: original_index(in_memory_limit=4)
+        try:
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i in range(12):
+                    zf.writestr('f%02d.txt' % i, ('content-%d' % i).encode() * 50)
+            zip_bytes = file.getvalue()
+
+            names, receipts = [], []
+            for name, receipt, chunks in stream_unzip(iter([zip_bytes]), strict=True):
+                names.append(name)
+                receipts.append(receipt)
+                b''.join(chunks)
+
+            self.assertEqual(names, [('f%02d.txt' % i).encode() for i in range(12)])
+            self.assertTrue(all(receipt.is_confirmed for receipt in receipts))
+        finally:
+            stream_unzip_module._SpooledMemberIndex = original_index
+
+    def test_non_strict_default_returns_three_tuple(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'content')
+        zip_bytes = file.getvalue()
+
+        for name, size, chunks in stream_unzip(iter([zip_bytes])):
+            self.assertEqual((name, size, b''.join(chunks)), (b'first.txt', 7, b'content'))
+
+    @staticmethod
+    def _make_zip64_archive():
+        name = b'a.txt'
+        data = b'zip64 payload ' * 100
+        crc = zlib.crc32(data)
+        compressobj = zlib.compressobj(6, zlib.DEFLATED, -15)
+        compressed = compressobj.compress(data) + compressobj.flush()
+
+        local_file_header = b'PK\x03\x04' + struct.pack(
+            '<H2sHHHIIIHH',
+            45, b'\x00\x00', 8, 0, 0, crc, 0xFFFFFFFF, 0xFFFFFFFF, len(name), 20,
+        )
+        local_file_header += name
+        local_file_header += struct.pack('<HH', 0x0001, 16)
+        local_file_header += struct.pack('<QQ', len(data), len(compressed))
+        local = local_file_header + compressed
+
+        central_extra = struct.pack('<HH', 0x0001, 24)
+        central_extra += struct.pack('<QQQ', len(data), len(compressed), 0)
+        central_directory = b'PK\x01\x02' + struct.pack(
+            '<HHHHHHIIIHHHHHII',
+            45, 45, 0, 8, 0, 0, crc, 0xFFFFFFFF, 0xFFFFFFFF,
+            len(name), len(central_extra), 0, 0, 0, 0, 0xFFFFFFFF,
+        ) + name + central_extra
+        central_directory_offset = len(local)
+        central_directory_size = len(central_directory)
+
+        end_64 = b'PK\x06\x06' + struct.pack(
+            '<QHHHHIIQQ',
+            44, 45, 45, 0, 0, 1, 1, central_directory_size, central_directory_offset,
+        )
+        locator = b'PK\x06\x07' + struct.pack(
+            '<IQI', 0, central_directory_offset + central_directory_size, 1,
+        )
+        end = b'PK\x05\x06' + struct.pack(
+            '<HHHHIIH', 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0,
+        )
+        return local + central_directory + end_64 + locator + end
+
+
+import contextlib as _contextlib
+import warnings as _warnings
+
+
+@_contextlib.contextmanager
+def warnings_zip(file):
+    with _warnings.catch_warnings():
+        _warnings.simplefilter('ignore')
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            yield zf

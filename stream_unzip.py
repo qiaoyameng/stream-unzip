@@ -2,6 +2,8 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import pickle
+import tempfile
 import zlib
 
 from Crypto.Cipher import AES
@@ -12,16 +14,110 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
-    local_file_header_signature = b'PK\x03\x04'
-    local_file_header_struct = Struct('<H2sHHHIIIHH')
-    zip64_compressed_size = 0xFFFFFFFF
-    zip64_size_signature = b'\x01\x00'
+_LOCAL_FILE_HEADER_SIGNATURE = b'PK\x03\x04'
+_CENTRAL_DIRECTORY_SIGNATURE = b'PK\x01\x02'
+_ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b'PK\x06\x06'
+_ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE = b'PK\x06\x07'
+_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b'PK\x05\x06'
+_ZIP64_SENTINEL32 = 0xFFFFFFFF
+_ZIP64_SIZE_EXTRA_SIGNATURE = b'\x01\x00'
+
+_LOCAL_FILE_HEADER_STRUCT = Struct('<H2sHHHIIIHH')
+_CENTRAL_DIRECTORY_STRUCT = Struct('<HHHHHHIIIHHHHHII')
+_END_OF_CENTRAL_DIRECTORY_STRUCT = Struct('<HHHHIIH')
+_ZIP64_END_OF_CENTRAL_DIRECTORY_STRUCT = Struct('<QHHHHIIQQ')
+_ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_STRUCT = Struct('<IQI')
+_UNSIGNED_SHORT = Struct('<H')
+_UNSIGNED_LONG_LONG = Struct('<Q')
+
+
+def _parse_extra(extra):
+    extra_offset = 0
+    while extra_offset <= len(extra) - 4:
+        extra_signature = extra[extra_offset:extra_offset + 2]
+        extra_data_size, = _UNSIGNED_SHORT.unpack(extra[extra_offset + 2:extra_offset + 4])
+        extra_offset += 4
+        yield extra_signature, extra[extra_offset:extra_offset + extra_data_size]
+        extra_offset += extra_data_size
+
+
+class MemberReceipt:
+    """A receipt for a member that is only trustworthy once the archive's tail is checked."""
+
+    PENDING = 0
+    CONFIRMED = 1
+
+    __slots__ = ('file_name', 'file_size', 'status')
+
+    def __init__(self, file_name, file_size):
+        self.file_name = file_name
+        self.file_size = file_size
+        self.status = self.PENDING
+
+    @property
+    def is_confirmed(self):
+        return self.status == self.CONFIRMED
+
+    def _confirm(self, file_size):
+        self.file_size = file_size
+        self.status = self.CONFIRMED
+
+
+class _SpooledMemberIndex:
+    """A bounded-memory sequential index of member records.
+
+    Records are kept in memory until a threshold, after which they are appended
+    to a temporary file. Replay always yields records in physical member order,
+    so duplicate names are matched by position rather than overwriting each other.
+    """
+
+    def __init__(self, in_memory_limit=1000):
+        self.in_memory_limit = in_memory_limit
+        self._in_memory = []
+        self._spool_file = None
+        self._num_disk_records = 0
+
+    def append(self, record):
+        if self._spool_file is None:
+            if len(self._in_memory) < self.in_memory_limit:
+                self._in_memory.append(record)
+                return
+            self._spool_file = tempfile.TemporaryFile()
+            for prior_record in self._in_memory:
+                pickle.dump(prior_record, self._spool_file, protocol=2)
+                self._num_disk_records += 1
+            self._in_memory = []
+        pickle.dump(record, self._spool_file, protocol=2)
+        self._num_disk_records += 1
+
+    def replay(self):
+        if self._spool_file is not None:
+            self._spool_file.seek(0)
+            for _ in range(self._num_disk_records):
+                yield pickle.load(self._spool_file)
+            self._spool_file.seek(0, 2)
+        else:
+            for record in self._in_memory:
+                yield record
+
+    def close(self):
+        if self._spool_file is not None:
+            self._spool_file.close()
+            self._spool_file = None
+        self._in_memory = []
+        self._num_disk_records = 0
+
+
+def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True, strict=False):
+    local_file_header_signature = _LOCAL_FILE_HEADER_SIGNATURE
+    local_file_header_struct = _LOCAL_FILE_HEADER_STRUCT
+    zip64_compressed_size = _ZIP64_SENTINEL32
+    zip64_size_signature = _ZIP64_SIZE_EXTRA_SIGNATURE
     aes_extra_signature = b'\x01\x99'
-    central_directory_signature = b'PK\x01\x02'
-    end_of_central_directory_signature = b'PK\x05\x06'
-    unsigned_short = Struct('<H')
-    unsigned_long_long = Struct('<Q')
+    central_directory_signature = _CENTRAL_DIRECTORY_SIGNATURE
+    end_of_central_directory_signature = _END_OF_CENTRAL_DIRECTORY_SIGNATURE
+    unsigned_short = _UNSIGNED_SHORT
+    unsigned_long_long = _UNSIGNED_LONG_LONG
 
     dd_optional_signature = b'PK\x07\x08'
     dd_struct_32 = Struct('<0sIII4s')
@@ -175,23 +271,12 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         return _decompress, _is_done, _num_unused
 
-    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start):
+    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, local_header_offset=None):
 
         def get_flag_bits(flags):
             for b in flags:
                 for i in range(8):
                     yield (b >> i) & 1
-
-        def parse_extra(extra):
-            extra_offset = 0
-            while extra_offset <= len(extra) - 4:
-                extra_signature = extra[extra_offset:extra_offset+2]
-                extra_offset += 2
-                extra_data_size, = unsigned_short.unpack(extra[extra_offset:extra_offset+2])
-                extra_offset += 2
-                extra_data = extra[extra_offset:extra_offset+extra_data_size]
-                extra_offset += extra_data_size
-                yield (extra_signature, extra_data)
 
         def get_extra_value(extra, if_true, signature, exception_if_missing, min_length, exception_if_too_short):
             value = None
@@ -300,12 +385,13 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
             return _iter(), lambda: offset_2 - offset_1, lambda: crc_32_actual, lambda: l
 
-        def checked_from_local_header(chunks, is_aes_2_encrypted, get_crc_32, get_compressed_size, get_uncompressed_size):
+        def checked_from_local_header(chunks, is_aes_2_encrypted, get_crc_32, get_compressed_size, get_uncompressed_size, set_compressed_size):
             yield from chunks
 
             crc_32_data = get_crc_32()
             compressed_size_data = get_compressed_size()
             uncompressed_size_data = get_uncompressed_size()
+            set_compressed_size(get_offset_from_start() - compressed_section_start)
 
             if not is_aes_2_encrypted and crc_32_expected != crc_32_data:
                 raise CRC32IntegrityError()
@@ -316,7 +402,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             if uncompressed_size_data != uncompressed_size:
                 raise UncompressedSizeIntegrityError()
 
-        def checked_from_data_descriptor(chunks, is_sure_zip64, is_aes_2_encrypted, get_crc_32, get_compressed_size, get_uncompressed_size):
+        def checked_from_data_descriptor(chunks, is_sure_zip64, is_aes_2_encrypted, get_crc_32, get_compressed_size, get_uncompressed_size, set_compressed_size):
             # The format of the data descriptor is unfortunately not known with absolute certainty in all cases
             # so we we use a heuristic to detect it - using the known crc32 value, compressed size, uncompressed
             # size of the data, and possible signature of the next section in the stream. There are 4 possible
@@ -372,6 +458,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             if not best_matches[4]:
                 raise UnexpectedSignatureError(next_signature)
 
+            set_compressed_size(compressed_size_dd)
             return_bytes_unused(dd[dd_struct.size - 4:])  # 4 is the length of next signature we have already taken
 
         version, flags, compression_raw, mod_time, mod_date, crc_32_expected, compressed_size_raw, uncompressed_size_raw, file_name_len, extra_field_len = \
@@ -387,7 +474,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnsupportedFlagsError(flag_bits)
 
         file_name = get_num(file_name_len)
-        extra = dict(parse_extra(get_num(extra_field_len)))
+        extra = dict(_parse_extra(get_num(extra_field_len)))
 
         is_weak_encrypted = flag_bits[0] and compression_raw != 99
         is_aes_encrypted = flag_bits[0] and compression_raw == 99
@@ -431,6 +518,8 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             get_decompressor_deflate64() if compression == 9 else \
             get_decompressor_bz2()
 
+        compressed_section_start = get_offset_from_start()
+
         decompressed_bytes = \
             decrypt_weak_decompress(yield_all(), *decompressor) if is_weak_encrypted else \
             decrypt_aes_decompress(yield_all(), *decompressor, key_length_raw=aes_extra[4]) if is_aes_encrypted else \
@@ -438,11 +527,29 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         counted_decompressed_bytes, get_compressed_size, get_crc_32_actual, get_uncompressed_size = read_data_and_count_and_crc32(decompressed_bytes)
 
+        authoritative_compressed_size = [None]
+
+        def set_compressed_size(value):
+            authoritative_compressed_size[0] = value
+
         checked_bytes = \
-            checked_from_data_descriptor(counted_decompressed_bytes, is_sure_zip64, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size) if has_data_descriptor else \
-            checked_from_local_header(counted_decompressed_bytes, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size)
-            
-        return file_name, uncompressed_size, checked_bytes
+            checked_from_data_descriptor(counted_decompressed_bytes, is_sure_zip64, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size, set_compressed_size) if has_data_descriptor else \
+            checked_from_local_header(counted_decompressed_bytes, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size, set_compressed_size)
+
+        def get_local_info():
+            return {
+                'local_header_offset': local_header_offset,
+                'file_name': file_name,
+                'compression_raw': compression_raw,
+                'flags': unsigned_short.unpack(flags)[0],
+                'is_aes_2_encrypted': is_aes_2_encrypted,
+                'crc_32': crc_32_expected if is_aes_2_encrypted else get_crc_32_actual(),
+                'compressed_size': authoritative_compressed_size[0],
+                'uncompressed_size': get_uncompressed_size(),
+                'is_zip64': is_sure_zip64,
+            }
+
+        return file_name, uncompressed_size, checked_bytes, get_local_info
 
     def all():
         yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = get_byte_readers(zipfile_chunks)
@@ -450,7 +557,10 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
         while True:
             signature = get_num(len(local_file_header_signature))
             if signature == local_file_header_signature:
-                yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start)
+                file_name, file_size, checked_bytes, _ = yield_file(
+                    yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start,
+                )
+                yield file_name, file_size, checked_bytes
             elif signature in (central_directory_signature, end_of_central_directory_signature):
                 for _ in yield_all():
                     pass
@@ -458,10 +568,249 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             else:
                 raise UnexpectedSignatureError(signature)
 
-    for file_name, file_size, unzipped_chunks in all():
-        yield file_name, file_size, unzipped_chunks
-        for _ in unzipped_chunks:
-            raise UnfinishedIterationError()
+    def resolve_central_directory_zip64_sizes(c_size_raw, u_size_raw, extra):
+        # In a central directory entry the ZIP64 extra field holds only the sizes whose
+        # raw 32-bit values are the 0xFFFFFFFF sentinel, in uncompressed/compressed order
+        c_size = c_size_raw
+        u_size = u_size_raw
+        zip64_block = None
+        if c_size_raw == zip64_compressed_size or u_size_raw == zip64_compressed_size:
+            try:
+                zip64_block = extra[zip64_size_signature]
+            except KeyError:
+                raise MissingZip64ExtraError()
+            block_offset = 0
+            if u_size_raw == zip64_compressed_size:
+                if len(zip64_block) < block_offset + 8:
+                    raise TruncatedZip64ExtraError()
+                u_size = unsigned_long_long.unpack(zip64_block[block_offset:block_offset + 8])[0]
+                block_offset += 8
+            if c_size_raw == zip64_compressed_size:
+                if len(zip64_block) < block_offset + 8:
+                    raise TruncatedZip64ExtraError()
+                c_size = unsigned_long_long.unpack(zip64_block[block_offset:block_offset + 8])[0]
+                block_offset += 8
+        return c_size, u_size, zip64_block
+
+    def verify_central_directory(get_num, get_offset_from_start, member_index, receipts, initial_signature):
+        # The physical order of central directory entries must match the physical order
+        # of local headers - duplicate names are therefore matched by position, not by name
+        member_records = member_index.replay()
+        position = 0
+        num_central_entries = 0
+        central_directory_size = 0
+        central_directory_start = \
+            get_offset_from_start() - len(central_directory_signature) if initial_signature == central_directory_signature else \
+            get_offset_from_start() - len(end_of_central_directory_signature)
+
+        signature = initial_signature
+
+        while signature == central_directory_signature:
+
+            try:
+                local_record = next(member_records)
+            except StopIteration:
+                raise CentralDirectoryMemberCountError(position + 1, position)
+
+            body = get_num(_CENTRAL_DIRECTORY_STRUCT.size)
+            if len(body) != _CENTRAL_DIRECTORY_STRUCT.size:
+                raise IncompleteArchiveError()
+            (
+                _version_made_by, _version_needed, central_flags, central_compression_raw,
+                _mod_time, _mod_date, central_crc_32, central_compressed_size_raw,
+                central_uncompressed_size_raw, file_name_len, extra_field_len,
+                comment_len, disk_number, _internal_attrs, _external_attrs,
+                central_local_header_offset_raw,
+            ) = _CENTRAL_DIRECTORY_STRUCT.unpack(body)
+
+            central_file_name = get_num(file_name_len)
+            central_extra = dict(_parse_extra(get_num(extra_field_len)))
+            if len(central_file_name) != file_name_len:
+                raise IncompleteArchiveError()
+
+            central_compressed_size, central_uncompressed_size, central_zip64_block = \
+                resolve_central_directory_zip64_sizes(
+                    central_compressed_size_raw, central_uncompressed_size_raw, central_extra,
+                )
+
+            central_local_header_offset = central_local_header_offset_raw
+            if central_local_header_offset_raw == zip64_compressed_size:
+                if central_zip64_block is None or len(central_zip64_block) < 24:
+                    raise TruncatedZip64ExtraError()
+                central_local_header_offset = unsigned_long_long.unpack(central_zip64_block[16:24])[0]
+
+            get_num(comment_len)
+
+            if central_file_name != local_record['file_name']:
+                raise CentralDirectoryNameMismatchError(
+                    position, local_record['file_name'], central_file_name,
+                )
+            if central_compression_raw != local_record['compression_raw']:
+                raise CentralDirectoryCompressionMethodMismatchError(position)
+            if central_flags != local_record['flags']:
+                raise CentralDirectoryFlagsMismatchError(position)
+            if disk_number != 0:
+                raise CentralDirectoryMultiDiskError(position)
+            if central_crc_32 != local_record['crc_32']:
+                raise CentralDirectoryCRC32MismatchError(position)
+            if central_compressed_size != local_record['compressed_size']:
+                raise CentralDirectoryCompressedSizeMismatchError(position)
+            if central_uncompressed_size != local_record['uncompressed_size']:
+                raise CentralDirectoryUncompressedSizeMismatchError(position)
+            if central_local_header_offset != local_record['local_header_offset']:
+                raise CentralDirectoryOffsetMismatchError(position)
+
+            position += 1
+            num_central_entries += 1
+            central_directory_size = get_offset_from_start() - central_directory_start
+
+            signature = get_num(4)
+            if signature not in (
+                central_directory_signature,
+                _ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+                end_of_central_directory_signature,
+            ):
+                raise UnexpectedSignatureError(signature)
+
+        try:
+            extra_local_records = sum(1 for _ in member_records)
+        except StopIteration:
+            extra_local_records = 0
+        if extra_local_records:
+            raise CentralDirectoryMemberCountError(num_central_entries, num_central_entries + extra_local_records)
+
+        zip64_total_entries = None
+        zip64_central_directory_size = None
+        zip64_central_directory_offset = None
+
+        if signature == _ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE:
+            if not allow_zip64:
+                raise UnsupportedZip64Error()
+            body = get_num(_ZIP64_END_OF_CENTRAL_DIRECTORY_STRUCT.size)
+            if len(body) != _ZIP64_END_OF_CENTRAL_DIRECTORY_STRUCT.size:
+                raise IncompleteArchiveError()
+            (
+                _eocd64_size, _version_made_by, _version_needed, disk_number,
+                disk_with_cd, disk_entries, total_entries, zip64_central_directory_size,
+                zip64_central_directory_offset,
+            ) = _ZIP64_END_OF_CENTRAL_DIRECTORY_STRUCT.unpack(body)
+            if disk_number != 0 or disk_with_cd != 0:
+                raise CentralDirectoryMultiDiskError(None)
+            if disk_entries != total_entries:
+                raise CentralDirectoryMemberCountError(total_entries, disk_entries)
+            zip64_total_entries = total_entries
+            locator_signature = get_num(4)
+            if locator_signature != _ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE:
+                raise UnexpectedSignatureError(locator_signature)
+            locator_body = get_num(_ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_STRUCT.size)
+            if len(locator_body) != _ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_STRUCT.size:
+                raise IncompleteArchiveError()
+            disk_with_cd, eocd64_offset, total_disks = \
+                _ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_STRUCT.unpack(locator_body)
+            if disk_with_cd != 0 or total_disks != 1:
+                raise CentralDirectoryMultiDiskError(None)
+            if eocd64_offset != get_offset_from_start() - _ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_STRUCT.size - 4 - _ZIP64_END_OF_CENTRAL_DIRECTORY_STRUCT.size - 4:
+                raise CentralDirectoryOffsetMismatchError(None)
+            trailing = get_num(4)
+            if trailing != end_of_central_directory_signature:
+                raise UnexpectedSignatureError(trailing)
+            signature = end_of_central_directory_signature
+
+        if signature != end_of_central_directory_signature:
+            raise IncompleteArchiveError()
+
+        body = get_num(_END_OF_CENTRAL_DIRECTORY_STRUCT.size)
+        if len(body) != _END_OF_CENTRAL_DIRECTORY_STRUCT.size:
+            raise IncompleteArchiveError()
+        (
+            disk_number, disk_with_cd, disk_entries, total_entries,
+            eocd_central_directory_size, eocd_central_directory_offset, comment_len,
+        ) = _END_OF_CENTRAL_DIRECTORY_STRUCT.unpack(body)
+        if disk_number != 0 or disk_with_cd != 0:
+            raise CentralDirectoryMultiDiskError(None)
+
+        expected_entries = zip64_total_entries if zip64_total_entries is not None else total_entries
+        is_zip64_eocd = zip64_total_entries is not None
+        effective_disk_entries = expected_entries if is_zip64_eocd and disk_entries == 0xFFFF else disk_entries
+        effective_total_entries = expected_entries if is_zip64_eocd and total_entries == 0xFFFF else total_entries
+        if effective_disk_entries != expected_entries or effective_total_entries != expected_entries or num_central_entries != expected_entries:
+            raise CentralDirectoryMemberCountError(expected_entries, num_central_entries)
+        if zip64_central_directory_size is not None and zip64_central_directory_size != central_directory_size:
+            raise CentralDirectorySizeMismatchError()
+        if zip64_central_directory_offset is not None and zip64_central_directory_offset != central_directory_start:
+            raise CentralDirectoryOffsetMismatchError(None)
+        if not (is_zip64_eocd or eocd_central_directory_size == 0xFFFFFFFF) and eocd_central_directory_size != central_directory_size:
+            raise CentralDirectorySizeMismatchError()
+        if not (is_zip64_eocd or eocd_central_directory_offset == 0xFFFFFFFF) and eocd_central_directory_offset != central_directory_start:
+            raise CentralDirectoryOffsetMismatchError(None)
+
+        comment = get_num(comment_len)
+        if len(comment) != comment_len:
+            raise IncompleteArchiveError()
+
+        for position, local_record in enumerate(member_index.replay()):
+            receipts[position]._confirm(local_record['uncompressed_size'])
+
+    def strict_all():
+        yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = get_byte_readers(zipfile_chunks)
+        member_index = _SpooledMemberIndex()
+        receipts = []
+
+        def members():
+            try:
+                while True:
+                    local_header_offset = get_offset_from_start()
+                    try:
+                        signature = get_num(len(local_file_header_signature))
+                    except TruncatedDataError:
+                        # No further local header and no central directory / end record at all
+                        raise IncompleteArchiveError() from None
+                    if signature == local_file_header_signature:
+                        file_name, file_size, checked_bytes, get_local_info = yield_file(
+                            yield_all, get_num, return_num_unused, return_bytes_unused,
+                            get_offset_from_start, local_header_offset,
+                        )
+                        receipt = MemberReceipt(file_name, file_size)
+                        receipts.append(receipt)
+
+                        def record_and_check(get_local_info=get_local_info, checked_bytes=checked_bytes):
+                            yield from checked_bytes
+                            member_index.append(get_local_info())
+
+                        yield file_name, receipt, record_and_check()
+                    elif signature == central_directory_signature:
+                        try:
+                            verify_central_directory(get_num, get_offset_from_start, member_index, receipts, signature)
+                        except TruncatedDataError:
+                            raise IncompleteArchiveError() from None
+                        break
+                    elif signature == end_of_central_directory_signature:
+                        try:
+                            # An archive with zero members goes straight to the end-of-central-directory
+                            # record - it is still only valid once that record has been checked
+                            verify_central_directory(get_num, get_offset_from_start, member_index, receipts, signature)
+                        except TruncatedDataError:
+                            raise IncompleteArchiveError() from None
+                        for _ in yield_all():
+                            pass
+                        break
+                    else:
+                        raise UnexpectedSignatureError(signature)
+            finally:
+                member_index.close()
+
+        yield from members()
+
+    if strict:
+        for file_name, receipt, unzipped_chunks in strict_all():
+            yield file_name, receipt, unzipped_chunks
+            for _ in unzipped_chunks:
+                raise UnfinishedIterationError()
+    else:
+        for file_name, file_size, unzipped_chunks in all():
+            yield file_name, file_size, unzipped_chunks
+            for _ in unzipped_chunks:
+                raise UnfinishedIterationError()
 
 
 async def async_stream_unzip(chunks, *args, **kwargs):
@@ -586,6 +935,45 @@ class UncompressedSizeIntegrityError(SizeIntegrityError):
     pass
 
 class CompressedSizeIntegrityError(SizeIntegrityError):
+    pass
+
+class CentralDirectoryIntegrityError(IntegrityError):
+    pass
+
+class CentralDirectoryNameMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryCompressionMethodMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryFlagsMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryCRC32MismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryCompressedSizeMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryUncompressedSizeMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryOffsetMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectorySizeMismatchError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryMemberCountError(CentralDirectoryIntegrityError):
+    pass
+
+class CentralDirectoryMultiDiskError(CentralDirectoryIntegrityError):
+    pass
+
+class MissingZip64ExtraError(MissingExtraError):
+    pass
+
+class IncompleteArchiveError(DataError):
     pass
 
 class PasswordError(UnzipValueError):
