@@ -2,6 +2,7 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import lzma
 import zlib
 
 from Crypto.Cipher import AES
@@ -21,6 +22,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
     central_directory_signature = b'PK\x01\x02'
     end_of_central_directory_signature = b'PK\x05\x06'
     unsigned_short = Struct('<H')
+    unsigned_long = Struct('<I')
     unsigned_long_long = Struct('<Q')
 
     dd_optional_signature = b'PK\x07\x08'
@@ -172,6 +174,99 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         def _num_unused():
             return len(dobj.unused_data)
+
+        return _decompress, _is_done, _num_unused
+
+    def get_decompressor_lzma(compressed_size, has_eos_marker):
+        # The compressed data of an LZMA member starts with its own header: two bytes of LZMA
+        # version, two bytes holding the size of the properties, and then the properties
+        # themselves, from which a raw decoder is built. When known (i.e. there is no data
+        # descriptor), compressed_size covers this header as well as the LZMA stream itself
+        dobj = None
+        header = bytearray()
+        num_fed = 0
+        num_extra = 0
+
+        def _make_dobj(version_major, version_minor, properties):
+            if len(properties) < 5:
+                raise TruncatedLZMAPropertiesError(len(properties))
+
+            properties_byte = properties[0]
+            lc = properties_byte % 9
+            pb, lp = divmod(properties_byte // 9, 5)
+            dict_size, = unsigned_long.unpack(properties[1:5])
+
+            try:
+                return lzma.LZMADecompressor(
+                    format=lzma.FORMAT_RAW,
+                    filters=[{
+                        'id': lzma.FILTER_LZMA1,
+                        'lc': lc,
+                        'lp': lp,
+                        'pb': pb,
+                        'dict_size': dict_size,
+                    }],
+                )
+            except lzma.LZMAError as e:
+                raise InvalidLZMAPropertiesError(properties) from e
+
+        def _decompress_single(compressed_chunk):
+            try:
+                return dobj.decompress(compressed_chunk, chunk_size)
+            except lzma.LZMAError as e:
+                raise LZMAError() from e
+
+        def _decompress(compressed_chunk):
+            nonlocal num_fed, num_extra, dobj, header
+
+            if compressed_size is None:
+                chunk = compressed_chunk
+                num_extra = 0
+            else:
+                # Never consume beyond the known compressed size - any bytes past it
+                # belong to the next member and are returned to the outer stream
+                budget = compressed_size - num_fed
+                chunk = compressed_chunk[:budget]
+                num_extra = len(compressed_chunk) - len(chunk)
+
+            num_fed += len(chunk)
+
+            if dobj is None:
+                # The version, properties size and properties themselves start the
+                # compressed data, and count towards its size
+                header += chunk
+                chunk = b''
+                if len(header) >= 4:
+                    properties_size, = unsigned_short.unpack(header[2:4])
+                    if len(header) >= 4 + properties_size:
+                        dobj = _make_dobj(header[0], header[1], bytes(header[4:4 + properties_size]))
+                        chunk = bytes(header[4 + properties_size:])
+                        del header[:]
+
+            if chunk:
+                uncompressed_chunk = _decompress_single(chunk)
+                if uncompressed_chunk:
+                    yield uncompressed_chunk
+
+                while not dobj.eof:
+                    uncompressed_chunk = _decompress_single(b'')
+                    if not uncompressed_chunk:
+                        break
+                    yield uncompressed_chunk
+
+            if dobj is not None and dobj.eof:
+                if compressed_size is not None and num_fed - len(dobj.unused_data) != compressed_size:
+                    raise PrematureLZMAEndOfStreamError()
+            elif has_eos_marker and compressed_size is not None and num_fed == compressed_size:
+                raise LZMARemainingDataError()
+
+        def _is_done():
+            return \
+                (dobj is not None and dobj.eof) or \
+                (compressed_size is not None and num_fed == compressed_size)
+
+        def _num_unused():
+            return num_extra + (len(dobj.unused_data) if dobj is not None else 0)
 
         return _decompress, _is_done, _num_unused
 
@@ -404,7 +499,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             unsigned_short.unpack(aes_extra[5:7])[0] if is_aes_encrypted else \
             compression_raw
 
-        if compression not in (0, 8, 9, 12):
+        if compression not in (0, 8, 9, 12, 14):
             raise UnsupportedCompressionTypeError(compression)
 
         has_data_descriptor = flag_bits[3]
@@ -416,19 +511,27 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnsupportedZip64Error()
 
         compressed_size = \
-            None if has_data_descriptor and compression in (8, 9, 12) else \
+            None if has_data_descriptor and compression in (8, 9, 12, 14) else \
             unsigned_long_long.unpack(zip64_extra[8:16])[0] if is_sure_zip64 else \
             compressed_size_raw
 
         uncompressed_size = \
-            None if has_data_descriptor and compression in (8, 9, 12) else \
+            None if has_data_descriptor and compression in (8, 9, 12, 14) else \
             unsigned_long_long.unpack(zip64_extra[:8])[0] if is_sure_zip64 else \
             uncompressed_size_raw
+
+        # For LZMA, general purpose bit 1 signals that the compressed data ends with an
+        # end-of-stream marker. Without it, the end of the member can only be found through
+        # a known compressed size, which a data descriptor does not provide up front
+        lzma_has_eos_marker = compression == 14 and flag_bits[1]
+        if compression == 14 and not lzma_has_eos_marker and compressed_size is None:
+            raise UnsupportedFlagsError(flag_bits)
 
         decompressor = \
             get_decompressor_none(uncompressed_size) if compression == 0 else \
             get_decompressor_deflate() if compression == 8 else \
             get_decompressor_deflate64() if compression == 9 else \
+            get_decompressor_lzma(None if (is_weak_encrypted or is_aes_encrypted) else compressed_size, lzma_has_eos_marker) if compression == 14 else \
             get_decompressor_bz2()
 
         decompressed_bytes = \
@@ -529,6 +632,21 @@ class DeflateError(UncompressError):
     pass
 
 class BZ2Error(UncompressError):
+    pass
+
+class LZMAError(UncompressError):
+    pass
+
+class TruncatedLZMAPropertiesError(LZMAError):
+    pass
+
+class InvalidLZMAPropertiesError(LZMAError):
+    pass
+
+class PrematureLZMAEndOfStreamError(LZMAError):
+    pass
+
+class LZMARemainingDataError(LZMAError):
     pass
 
 class UnsupportedFeatureError(DataError):

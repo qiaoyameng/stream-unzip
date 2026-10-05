@@ -21,4 +21,6 @@ In addition to being memory efficient, stream-unzip supports:
 
 - BZip2-compressed ZIPs.
 
+- LZMA-compressed ZIPs.
+
 - An async interface (that uses threads under the hood).

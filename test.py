@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import io
 import platform
+import struct
 import unittest
 import uuid
 import random
@@ -23,6 +24,10 @@ from stream_unzip import (
     IncorrectZipCryptoPasswordError,
     IncorrectAESPasswordError,
     DeflateError,
+    TruncatedLZMAPropertiesError,
+    InvalidLZMAPropertiesError,
+    PrematureLZMAEndOfStreamError,
+    LZMARemainingDataError,
 )
 
 
@@ -32,7 +37,7 @@ class TestStreamUnzip(unittest.TestCase):
         rnd = random.Random()
         rnd.seed(1)
 
-        methods = [zipfile.ZIP_BZIP2, zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED]
+        methods = [zipfile.ZIP_BZIP2, zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED, zipfile.ZIP_LZMA]
         input_sizes = [1, 7, 65536]
         output_sizes = [1, 7, 65536]
 
@@ -271,6 +276,195 @@ class TestStreamUnzip(unittest.TestCase):
                     for _, _, chunks in stream_unzip(yield_input(input_size), chunk_size=output_size):
                         for _ in chunks:
                             pass
+
+    def test_lzma(self):
+        rnd = random.Random()
+        rnd.seed(1)
+
+        output_sizes = [1, 7, 65536]
+
+        names = ['first.txt', 'second.txt', 'third.txt']
+        contents = [
+            b'short',
+            b''.join([uuid.UUID(int=rnd.getrandbits(128), version=4).hex.encode() for _ in range(0, 10000)]),
+            b'',
+        ]
+
+        def zip_bytes():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                for name, content in zip(names, contents):
+                    zf.writestr(name, content)
+            return file.getvalue()
+
+        def yield_input(input_size):
+            zip_bytes_ = zip_bytes()
+            if input_size is None:
+                # Irregularly-sized chunks
+                offset = 0
+                while offset < len(zip_bytes_):
+                    chunk_length = rnd.randint(1, 997)
+                    yield zip_bytes_[offset:offset + chunk_length]
+                    offset += chunk_length
+            else:
+                for i in range(0, len(zip_bytes_), input_size):
+                    yield zip_bytes_[i:i + input_size]
+
+        combinations_iter = itertools.product([1, 7, 65536, None], output_sizes)
+        for input_size, output_size in combinations_iter:
+            with self.subTest(input_size=input_size, output_size=output_size):
+                files = [
+                    (name, size, b''.join(chunks))
+                    for name, size, chunks in stream_unzip(yield_input(input_size), chunk_size=output_size)
+                ]
+                self.assertEqual([name for name, _, _ in files], [name.encode() for name in names])
+                for (_, size, content), expected_content in zip(files, contents):
+                    self.assertEqual(size, len(expected_content))
+                    self.assertEqual(content, expected_content)
+
+    def test_lzma_data_descriptor(self):
+        rnd = random.Random()
+        rnd.seed(1)
+
+        class UnseekableBytesIO(io.BytesIO):
+            def seek(self, *args, **kwargs):
+                raise OSError('Unseekable')
+
+        contents = [
+            b'short',
+            b''.join([uuid.UUID(int=rnd.getrandbits(128), version=4).hex.encode() for _ in range(0, 10000)]),
+        ]
+
+        def yield_input(input_size):
+            # Writing to an unseekable file makes zipfile use data descriptors, so the
+            # sizes are not known before the LZMA data itself, and its end-of-stream
+            # marker is the only thing that signals the end of each member
+            file = UnseekableBytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                zf.writestr('first.txt', contents[0])
+                zf.writestr('second.txt', contents[1])
+
+            zip_bytes = file.getvalue()
+            self.assertEqual(zip_bytes[6] & 0x0A, 0x0A)  # EOS marker and data descriptor flags
+
+            for i in range(0, len(zip_bytes), input_size):
+                yield zip_bytes[i:i + input_size]
+
+        for input_size in [1, 7, 65536]:
+            with self.subTest(input_size=input_size):
+                files = [
+                    (name, size, b''.join(chunks))
+                    for name, size, chunks in stream_unzip(yield_input(input_size))
+                ]
+                self.assertEqual([name for name, _, _ in files], [b'first.txt', b'second.txt'])
+                self.assertEqual([size for _, size, _ in files], [None, None])
+                self.assertEqual([content for _, _, content in files], contents)
+
+    def test_lzma_bad_properties(self):
+        content = b'hello world' * 1000
+
+        def make_zip_bytes():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                zf.writestr('first.txt', content)
+                zf.writestr('second.txt', content)
+            return file.getvalue()
+
+        def compressed_data_offset(zip_bytes):
+            file_name_len, extra_field_len = struct.unpack_from('<HH', zip_bytes, 26)
+            return 30 + file_name_len + extra_field_len
+
+        def yield_input(zip_bytes):
+            for i in range(0, len(zip_bytes)):
+                yield zip_bytes[i:i + 1]
+
+        # Corrupt the lc/lp/pb properties byte so a decoder cannot be built from it.
+        # The second member must not end up treated as part of the first
+        zip_bytes = bytearray(make_zip_bytes())
+        zip_bytes[compressed_data_offset(zip_bytes) + 4] = 0xFF
+        with self.assertRaises(InvalidLZMAPropertiesError):
+            for _, _, chunks in stream_unzip(yield_input(bytes(zip_bytes))):
+                for _ in chunks:
+                    pass
+
+        # A properties size smaller than the 5 bytes that LZMA1 requires
+        zip_bytes = bytearray(make_zip_bytes())
+        struct.pack_into('<H', zip_bytes, compressed_data_offset(zip_bytes) + 2, 3)
+        with self.assertRaises(TruncatedLZMAPropertiesError):
+            for _, _, chunks in stream_unzip(yield_input(bytes(zip_bytes))):
+                for _ in chunks:
+                    pass
+
+    def test_lzma_truncated(self):
+        content = b'hello world' * 1000
+
+        def yield_input():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                zf.writestr('first.txt', content)
+                zf.writestr('second.txt', content)
+
+            zip_bytes = file.getvalue()
+            file_name_len, extra_field_len = struct.unpack_from('<HH', zip_bytes, 26)
+            compressed_data_offset = 30 + file_name_len + extra_field_len
+
+            # Cut the stream inside the first member's compressed data, so its
+            # end-of-stream marker never arrives
+            truncated = zip_bytes[:compressed_data_offset + 20]
+            for i in range(0, len(truncated)):
+                yield truncated[i:i + 1]
+
+        with self.assertRaises(TruncatedDataError):
+            for _, _, chunks in stream_unzip(yield_input()):
+                for _ in chunks:
+                    pass
+
+    def test_lzma_compressed_size_mismatch(self):
+        content = b'hello world' * 1000
+
+        def make_zip_bytes():
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                zf.writestr('first.txt', content)
+                zf.writestr('second.txt', content)
+            return file.getvalue()
+
+        # The compressed size in the local header is at offset 18. If it claims the
+        # member is longer than its actual end-of-stream marker, the bytes of the
+        # following member must not be treated as part of this one
+        zip_bytes = bytearray(make_zip_bytes())
+        compressed_size, = struct.unpack_from('<I', zip_bytes, 18)
+        struct.pack_into('<I', zip_bytes, 18, compressed_size + 10)
+        with self.assertRaises(PrematureLZMAEndOfStreamError):
+            for _, _, chunks in stream_unzip(iter([bytes(zip_bytes)])):
+                for _ in chunks:
+                    pass
+
+        # If it claims the member is shorter, the LZMA stream is not finished when
+        # the declared number of compressed bytes has been consumed
+        zip_bytes = bytearray(make_zip_bytes())
+        struct.pack_into('<I', zip_bytes, 18, compressed_size - 10)
+        with self.assertRaises(LZMARemainingDataError):
+            for _, _, chunks in stream_unzip(iter([bytes(zip_bytes)])):
+                for _ in chunks:
+                    pass
+
+    def test_lzma_bad_crc_32(self):
+        content = b'hello world' * 1000
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+            zf.writestr('first.txt', content)
+            zf.writestr('second.txt', content)
+
+        # The CRC-32 in the local header is at offset 14
+        zip_bytes = bytearray(file.getvalue())
+        zip_bytes[14] ^= 0xFF
+
+        with self.assertRaises(CRC32IntegrityError):
+            for _, _, chunks in stream_unzip(iter([bytes(zip_bytes)])):
+                for _ in chunks:
+                    pass
 
     def test_break_raises_generator_exit(self):
         rnd = random.Random()
