@@ -21,4 +21,6 @@ In addition to being memory efficient, stream-unzip supports:
 
 - BZip2-compressed ZIPs.
 
+- LZMA-compressed ZIPs (compression method 14), using only the Python standard library.
+
 - An async interface (that uses threads under the hood).

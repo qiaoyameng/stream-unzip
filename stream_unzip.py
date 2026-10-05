@@ -2,6 +2,7 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import lzma
 import zlib
 
 from Crypto.Cipher import AES
@@ -21,6 +22,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
     central_directory_signature = b'PK\x01\x02'
     end_of_central_directory_signature = b'PK\x05\x06'
     unsigned_short = Struct('<H')
+    unsigned_long = Struct('<I')
     unsigned_long_long = Struct('<Q')
 
     dd_optional_signature = b'PK\x07\x08'
@@ -109,7 +111,6 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         def _num_unused():
             return num_unused
-
         return _decompress, _is_done, _num_unused
 
     def get_decompressor_deflate():
@@ -172,6 +173,169 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         def _num_unused():
             return len(dobj.unused_data)
+
+        return _decompress, _is_done, _num_unused
+
+    def get_decompressor_lzma(has_eos_marker, compressed_size, uncompressed_size, return_bytes_unused):
+        input_buffer = b''
+        header_size = None
+        raw_size = None
+        dobj = None
+        num_raw_fed = 0
+        num_output = 0
+        finished = False
+
+        def build_filter(header):
+            encoded_properties = header[4]
+            if encoded_properties > 134:
+                raise InvalidLZMAPropertiesError()
+
+            lc = encoded_properties % 9
+            remainder = encoded_properties // 9
+            lp = remainder % 5
+            pb = remainder // 5
+            dict_size, = unsigned_long.unpack(header[5:9])
+
+            return {
+                'id': lzma.FILTER_LZMA1,
+                'dict_size': dict_size,
+                'lc': lc,
+                'lp': lp,
+                'pb': pb,
+            }
+
+        def decompress_chunk(chunk):
+            try:
+                return dobj.decompress(chunk, chunk_size)
+            except lzma.LZMAError as e:
+                raise LZMAError() from e
+
+        def finish(unused_bytes):
+            nonlocal finished
+            if unused_bytes:
+                return_bytes_unused(unused_bytes)
+            finished = True
+
+        def drain_output(output):
+            nonlocal num_output
+            while output:
+                num_output += len(output)
+                if uncompressed_size is not None and num_output > uncompressed_size:
+                    raise UncompressedSizeIntegrityError()
+                yield output
+                if dobj.eof:
+                    return
+                output = decompress_chunk(b'')
+
+        def _decompress(compressed_chunk):
+            nonlocal input_buffer, header_size, raw_size, dobj
+            nonlocal num_raw_fed, num_output
+
+            if finished:
+                return
+
+            input_buffer += compressed_chunk
+
+            if dobj is None:
+                if len(input_buffer) < 4:
+                    return
+
+                lzma_version_major, lzma_version_minor = input_buffer[0], input_buffer[1]
+                properties_size, = unsigned_short.unpack(input_buffer[2:4])
+                if properties_size != 5:
+                    raise InvalidLZMAPropertiesSizeError(properties_size)
+
+                header_size = 4 + properties_size
+                if len(input_buffer) < header_size:
+                    return
+
+                if compressed_size is not None and compressed_size < header_size:
+                    raise CompressedSizeIntegrityError()
+                raw_size = None if compressed_size is None else compressed_size - header_size
+
+                try:
+                    dobj = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[build_filter(input_buffer)])
+                except (lzma.LZMAError, ValueError) as e:
+                    raise InvalidLZMAPropertiesError() from e
+
+            while not finished:
+                if dobj.eof:
+                    actual_size = num_raw_fed - len(dobj.unused_data)
+                    if raw_size is None:
+                        unused_bytes = input_buffer[header_size + actual_size:]
+                    elif actual_size < raw_size:
+                        raise PrematureLZMAEOSError()
+                    elif not has_eos_marker:
+                        raise LZMAError()
+                    else:
+                        unused_bytes = input_buffer[compressed_size:]
+
+                    finish(unused_bytes)
+                    return
+
+                available = input_buffer[header_size + num_raw_fed:]
+                if raw_size is not None:
+                    remaining = raw_size - num_raw_fed
+                    if remaining <= 0:
+                        if has_eos_marker:
+                            raise LZMAError()
+                        if num_output == uncompressed_size:
+                            finish(input_buffer[compressed_size:])
+                            return
+                        if not available:
+                            return
+
+                        available = available[:1]
+                        num_raw_fed += 1
+                        output = decompress_chunk(available)
+                        yield from drain_output(output)
+
+                        if dobj.eof:
+                            raise LZMAError()
+                        if num_output != uncompressed_size:
+                            if num_output > uncompressed_size:
+                                raise UncompressedSizeIntegrityError()
+                            raise LZMAError()
+
+                        finish(input_buffer[compressed_size:])
+                        return
+
+                    available = available[:remaining]
+
+                elif not available:
+                    return
+
+                num_raw_fed += len(available)
+                output = decompress_chunk(available)
+                yield from drain_output(output)
+
+                if raw_size is not None and not has_eos_marker:
+                    if num_output == uncompressed_size and num_raw_fed < raw_size:
+                        raise CompressedSizeIntegrityError()
+
+                if dobj.eof:
+                    continue
+
+                if raw_size is not None and has_eos_marker and num_raw_fed == raw_size and not dobj.eof:
+                    yield from drain_output(decompress_chunk(b''))
+
+                if dobj.eof:
+                    continue
+
+                if raw_size is not None and not has_eos_marker and num_output < uncompressed_size:
+                    if num_raw_fed == raw_size and not input_buffer[compressed_size:compressed_size + 1]:
+                        return
+
+                if raw_size is not None and has_eos_marker and not dobj.eof:
+                    return
+
+                return
+
+        def _is_done():
+            return finished
+
+        def _num_unused():
+            return 0
 
         return _decompress, _is_done, _num_unused
 
@@ -404,10 +568,17 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             unsigned_short.unpack(aes_extra[5:7])[0] if is_aes_encrypted else \
             compression_raw
 
-        if compression not in (0, 8, 9, 12):
+        if compression == 14 and flag_bits[0]:
+            raise UnsupportedFlagsError(flag_bits)
+
+        if compression not in (0, 8, 9, 12, 14):
             raise UnsupportedCompressionTypeError(compression)
 
         has_data_descriptor = flag_bits[3]
+        has_lzma_eos_marker = compression == 14 and bool(flag_bits[1])
+        if compression == 14 and has_data_descriptor and not has_lzma_eos_marker:
+            raise UnsupportedFlagsError(flag_bits)
+
         might_be_zip64 = compressed_size_raw == zip64_compressed_size and uncompressed_size_raw == zip64_compressed_size 
         zip64_extra = get_extra_value(extra, might_be_zip64, zip64_size_signature, False, 16, TruncatedZip64ExtraError)
         is_sure_zip64 = bool(zip64_extra)
@@ -416,12 +587,12 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnsupportedZip64Error()
 
         compressed_size = \
-            None if has_data_descriptor and compression in (8, 9, 12) else \
+            None if has_data_descriptor and compression in (8, 9, 12, 14) else \
             unsigned_long_long.unpack(zip64_extra[8:16])[0] if is_sure_zip64 else \
             compressed_size_raw
 
         uncompressed_size = \
-            None if has_data_descriptor and compression in (8, 9, 12) else \
+            None if has_data_descriptor and compression in (8, 9, 12, 14) else \
             unsigned_long_long.unpack(zip64_extra[:8])[0] if is_sure_zip64 else \
             uncompressed_size_raw
 
@@ -429,7 +600,8 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             get_decompressor_none(uncompressed_size) if compression == 0 else \
             get_decompressor_deflate() if compression == 8 else \
             get_decompressor_deflate64() if compression == 9 else \
-            get_decompressor_bz2()
+            get_decompressor_bz2() if compression == 12 else \
+            get_decompressor_lzma(has_lzma_eos_marker, compressed_size, uncompressed_size, return_bytes_unused)
 
         decompressed_bytes = \
             decrypt_weak_decompress(yield_all(), *decompressor) if is_weak_encrypted else \
@@ -529,6 +701,18 @@ class DeflateError(UncompressError):
     pass
 
 class BZ2Error(UncompressError):
+    pass
+
+class LZMAError(UncompressError):
+    pass
+
+class InvalidLZMAPropertiesError(LZMAError):
+    pass
+
+class InvalidLZMAPropertiesSizeError(InvalidLZMAPropertiesError):
+    pass
+
+class PrematureLZMAEOSError(LZMAError):
     pass
 
 class UnsupportedFeatureError(DataError):

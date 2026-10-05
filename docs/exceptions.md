@@ -76,6 +76,22 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
 
                     An error in the deflate-compressed data meant it could not be decompressed.
 
+                - **LZMAError**
+
+                    An error in the LZMA-compressed data meant it could not be decompressed.
+
+                    - **InvalidLZMAPropertiesError**
+
+                        The LZMA properties header contained invalid parameters.
+
+                        - **InvalidLZMAPropertiesSizeError**
+
+                            The LZMA properties header was too short or declared an unsupported properties size.
+
+                    - **PrematureLZMAEOSError**
+
+                        An LZMA end-of-stream marker was encountered before all compressed bytes declared by the ZIP member had been consumed.
+
             - **IntegrityError**
 
                 - **HMACIntegrityError**

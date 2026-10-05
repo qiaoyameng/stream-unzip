@@ -1,11 +1,14 @@
 import asyncio
 import itertools
 import io
+import lzma
 import platform
+import struct
 import unittest
 import uuid
 import random
 import zipfile
+import zlib
 
 from stream_unzip import (
     async_stream_unzip,
@@ -18,11 +21,16 @@ from stream_unzip import (
     UnexpectedSignatureError,
     HMACIntegrityError,
     CRC32IntegrityError,
+    CompressedSizeIntegrityError,
     MissingZipCryptoPasswordError,
     MissingAESPasswordError,
     IncorrectZipCryptoPasswordError,
     IncorrectAESPasswordError,
     DeflateError,
+    LZMAError,
+    InvalidLZMAPropertiesError,
+    InvalidLZMAPropertiesSizeError,
+    PrematureLZMAEOSError,
 )
 
 
@@ -65,6 +73,270 @@ class TestStreamUnzip(unittest.TestCase):
                 self.assertEqual(files[1][0], b'second.txt')
                 self.assertEqual(files[1][1], len(content))
                 self.assertEqual(files[1][2], content)
+
+    def test_lzma_multiple_members_and_chunk_sizes(self):
+        rnd = random.Random()
+        rnd.seed(14)
+        contents = [
+            b'',
+            b'short',
+            b''.join([uuid.UUID(int=rnd.getrandbits(128), version=4).hex.encode() for _ in range(1000)]),
+        ]
+        input_chunks = ((1,), (1, 2, 7, 3, 11, 5), (65536,))
+        output_sizes = (1, 7, 65536)
+
+        for index, content in enumerate(contents):
+            file = io.BytesIO()
+            with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+                zf.writestr('first.txt', content)
+                zf.writestr('second.txt', content + b'!')
+
+            zip_bytes = file.getvalue()
+            for pattern in input_chunks:
+                sizes = itertools.cycle(pattern)
+                chunks = []
+                offset = 0
+                while offset < len(zip_bytes):
+                    size = next(sizes)
+                    chunks.append(zip_bytes[offset:offset + size])
+                    offset += size
+
+                for output_size in output_sizes:
+                    with self.subTest(content=index, pattern=pattern, output_size=output_size):
+                        files = [
+                            (name, size, b''.join(data))
+                            for name, size, data in stream_unzip(chunks, chunk_size=output_size)
+                        ]
+                        self.assertEqual(files, [
+                            (b'first.txt', len(content), content),
+                            (b'second.txt', len(content) + 1, content + b'!'),
+                        ])
+
+    def test_lzma_without_eos_marker_and_data_descriptor(self):
+        properties = b'\x5d\x00\x00\x80\x00'
+        lzma_filter = {
+            'id': lzma.FILTER_LZMA1,
+            'dict_size': 8388608,
+            'lc': 3,
+            'lp': 0,
+            'pb': 2,
+        }
+
+        def lzma_raw(data, include_eos):
+            compressor = lzma.LZMACompressor(lzma.FORMAT_RAW, filters=[lzma_filter])
+            raw = compressor.compress(data) + compressor.flush()
+            return raw if include_eos else raw[:-6]
+
+        def make_zip(files, include_eos, use_data_descriptor):
+            output = io.BytesIO()
+            entries = []
+            for name, data in files:
+                name_bytes = name.encode()
+                raw = lzma_raw(data, include_eos)
+                body = b'\x09\x04\x05\x00' + properties + raw
+                flags = (0x2 if include_eos else 0) | (0x8 if use_data_descriptor else 0)
+                crc = zlib.crc32(data)
+                offset = output.tell()
+                output.write(struct.pack(
+                    '<4s2B4HL2L2H',
+                    b'PK\x03\x04', 63, 0, flags, zipfile.ZIP_LZMA, 0, 0,
+                    crc,
+                    0 if use_data_descriptor else len(body),
+                    0 if use_data_descriptor else len(data),
+                    len(name_bytes), 0,
+                ))
+                output.write(name_bytes)
+                body_start = output.tell()
+                output.write(body)
+                if use_data_descriptor:
+                    output.write(b'PK\x07\x08' + struct.pack('<III', crc, len(body), len(data)))
+                entries.append((offset, body_start, name_bytes, flags, crc, len(body), len(data)))
+
+            central_directory_start = output.tell()
+            for offset, _, name_bytes, flags, crc, compressed_size, uncompressed_size in entries:
+                output.write(struct.pack(
+                    '<I4B4H3L5H2L',
+                    0x02014b50, 63, 63, 63, 0, flags, zipfile.ZIP_LZMA, 0, 0,
+                    crc, compressed_size, uncompressed_size, len(name_bytes),
+                    0, 0, 0, 0, 0, offset,
+                ))
+                output.write(name_bytes)
+            central_directory_end = output.tell()
+            output.write(struct.pack(
+                '<IHHHHIIH',
+                0x06054b50, 0, 0, len(entries), len(entries),
+                central_directory_end - central_directory_start,
+                central_directory_start, 0,
+            ))
+            return output.getvalue()
+
+        files = [('first.txt', b'short'), ('second.txt', b'x' * 1000)]
+        cases = (
+            (False, False),
+            (True, True),
+        )
+        patterns = ((1,), (1, 2, 7, 3, 11, 5), (65536,))
+
+        for include_eos, use_data_descriptor in cases:
+            zip_bytes = make_zip(files, include_eos, use_data_descriptor)
+            for pattern in patterns:
+                sizes = itertools.cycle(pattern)
+                chunks = []
+                offset = 0
+                while offset < len(zip_bytes):
+                    size = next(sizes)
+                    chunks.append(zip_bytes[offset:offset + size])
+                    offset += size
+
+                with self.subTest(include_eos=include_eos, data_descriptor=use_data_descriptor):
+                    result = [
+                        (name, size, b''.join(data))
+                        for name, size, data in stream_unzip(chunks, chunk_size=5)
+                    ]
+                    self.assertEqual(result, [
+                        (b'first.txt', None if use_data_descriptor else 5, files[0][1]),
+                        (b'second.txt', None if use_data_descriptor else 1000, files[1][1]),
+                    ])
+
+    def test_lzma_invalid_properties(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+            zf.writestr('first.txt', b'short')
+            zf.writestr('second.txt', b'second')
+        zip_bytes = bytearray(file.getvalue())
+        data_offset = 30 + len('first.txt')
+
+        short_properties = bytearray(zip_bytes)
+        struct.pack_into('<H', short_properties, data_offset + 2, 4)
+
+        truncated_properties = zip_bytes[:data_offset + 7]
+
+        invalid_properties = bytearray(zip_bytes)
+        invalid_properties[data_offset + 4] = 0xff
+
+        for corrupted, error in (
+            (short_properties, InvalidLZMAPropertiesSizeError),
+            (truncated_properties, TruncatedDataError),
+            (invalid_properties, InvalidLZMAPropertiesError),
+        ):
+            with self.subTest(error=error.__name__):
+                input_chunks = [
+                    bytes(corrupted)[i:i + 1]
+                    for i in range(0, len(corrupted))
+                ]
+                iterator = iter(stream_unzip(input_chunks, chunk_size=4))
+                name, size, chunks = next(iterator)
+                self.assertEqual(name, b'first.txt')
+                with self.assertRaises(error):
+                    b''.join(chunks)
+
+    def test_lzma_encryption_is_not_half_supported(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+            zf.writestr('first.txt', b'short')
+
+        zip_bytes = bytearray(file.getvalue())
+        zip_bytes[6] |= 1
+
+        with self.assertRaises(UnsupportedFlagsError):
+            for name, size, chunks in stream_unzip([bytes(zip_bytes)], password=b'password'):
+                b''.join(chunks)
+
+    def test_lzma_premature_eos_and_remaining_data(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+            zf.writestr('first.txt', b'short')
+            zf.writestr('second.txt', b'second')
+        eos_zip = bytearray(file.getvalue())
+        data_offset = 30 + len('first.txt')
+        compressed_size, = struct.unpack_from('<I', eos_zip, 18)
+        eos_zip[data_offset + compressed_size:data_offset + compressed_size] = b'xyz'
+        struct.pack_into('<I', eos_zip, 18, compressed_size + 3)
+
+        properties = b'\x5d\x00\x00\x80\x00'
+        lzma_filter = {
+            'id': lzma.FILTER_LZMA1,
+            'dict_size': 8388608,
+            'lc': 3,
+            'lp': 0,
+            'pb': 2,
+        }
+
+        def make_remaining_zip():
+            data = bytes((index * 7 + 3) % 256 for index in range(800))
+            compressor = lzma.LZMACompressor(lzma.FORMAT_RAW, filters=[lzma_filter])
+            raw = (compressor.compress(data) + compressor.flush())[:-6]
+            raw_with_extra_byte = raw + b'abc'
+            body = b'\x09\x04\x05\x00' + properties + raw_with_extra_byte
+
+            output = io.BytesIO()
+            name = b'first.txt'
+            offset = output.tell()
+            crc = zlib.crc32(data)
+            output.write(struct.pack(
+                '<4s2B4HL2L2H',
+                b'PK\x03\x04', 63, 0, 0, zipfile.ZIP_LZMA, 0, 0,
+                crc,
+                len(body), len(data), len(name), 0,
+            ))
+            output.write(name)
+            output.write(body)
+            central_directory_start = output.tell()
+            output.write(struct.pack(
+                '<I4B4H3L5H2L',
+                0x02014b50, 63, 63, 63, 0, 0, zipfile.ZIP_LZMA, 0, 0,
+                crc, len(body), len(data), len(name),
+                0, 0, 0, 0, 0, offset,
+            ))
+            output.write(name)
+            central_directory_end = output.tell()
+            output.write(struct.pack(
+                '<IHHHHIIH',
+                0x06054b50, 0, 0, 1, 1,
+                central_directory_end - central_directory_start,
+                central_directory_start, 0,
+            ))
+            return output.getvalue()
+
+        remaining_zip = make_remaining_zip()
+
+        for corrupted, error in (
+            (bytes(eos_zip), PrematureLZMAEOSError),
+            (bytes(remaining_zip), CompressedSizeIntegrityError),
+        ):
+            with self.subTest(error=error.__name__):
+                iterator = iter(stream_unzip([corrupted], chunk_size=4))
+                name, size, chunks = next(iterator)
+                self.assertEqual(name, b'first.txt')
+                with self.assertRaises(error):
+                    b''.join(chunks)
+
+    def test_lzma_truncated_stream_does_not_include_next_member(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_LZMA) as zf:
+            zf.writestr('first.txt', b'x' * 1000)
+            zf.writestr('second.txt', b'second')
+        zip_bytes = file.getvalue()
+        data_offset = 30 + len('first.txt')
+        compressed_size, = struct.unpack_from('<I', zip_bytes, 18)
+        first_data_end = data_offset + compressed_size
+
+        truncated_with_next_member = zip_bytes[:first_data_end - 3] + zip_bytes[first_data_end:]
+        truncated_archive = zip_bytes[:first_data_end - 3]
+
+        iterator = iter(stream_unzip([truncated_with_next_member], chunk_size=4))
+        name, size, chunks = next(iterator)
+        self.assertEqual(name, b'first.txt')
+        with self.assertRaises((LZMAError, TruncatedDataError, CRC32IntegrityError, UnexpectedSignatureError)):
+            try:
+                b''.join(chunks)
+                next(iterator)
+            except StopIteration:
+                self.fail('Following member was parsed as part of the truncated LZMA member')
+
+        with self.assertRaises(TruncatedDataError):
+            for name, size, chunks in stream_unzip([truncated_archive], chunk_size=4):
+                b''.join(chunks)
 
     def test_skipping_wrapper(self):
         rnd = random.Random()
