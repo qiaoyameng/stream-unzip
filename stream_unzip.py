@@ -2,6 +2,8 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import hashlib
+import json
 import zlib
 
 from Crypto.Cipher import AES
@@ -12,7 +14,164 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
+# Recovery points are mappings with this format and version, serialisable as JSON
+# (so never depend on pickle). They allow a download of a large ZIP that was
+# interrupted to be resumed from the last fully-verified member boundary
+recovery_point_format = 'stream-unzip-recovery-point'
+recovery_point_version = 1
+
+# The number of bytes from the start of the archive that establish its identity.
+# A recovery point can only be exported once all of these have been consumed
+archive_identity_size = 4096
+
+
+def recovery_point_to_json(recovery_point):
+    return json.dumps(recovery_point, sort_keys=True)
+
+
+def recovery_point_from_json(recovery_point_json):
+    try:
+        recovery_point = json.loads(recovery_point_json)
+    except ValueError:
+        raise InvalidRecoveryPointError('Recovery point is not valid JSON') from None
+
+    if not isinstance(recovery_point, dict):
+        raise InvalidRecoveryPointError('Recovery point must be a JSON object')
+
+    return recovery_point
+
+
+def _parse_recovery_point(resume_from):
+    # Returns the verified contents of a recovery point supplied to resume a
+    # previous run, raising InvalidRecoveryPointError if anything is not as expected
+    if isinstance(resume_from, (str, bytes, bytearray)):
+        resume_from = recovery_point_from_json(resume_from)
+
+    if not isinstance(resume_from, dict):
+        raise InvalidRecoveryPointError('Recovery point must be a mapping or a JSON object')
+
+    def _invalid(message):
+        return InvalidRecoveryPointError('Invalid recovery point: ' + message)
+
+    if resume_from.get('format') != recovery_point_format:
+        raise _invalid('unrecognised format')
+
+    if resume_from.get('version') != recovery_point_version:
+        raise _invalid('unsupported version')
+
+    offset = resume_from.get('offset')
+    if type(offset) is not int or offset < 0:
+        raise _invalid('offset must be a non-negative integer')
+
+    def _hex_256(value, name):
+        if not isinstance(value, str) or len(value) != 64:
+            raise _invalid(name + ' must be a SHA-256 hex string')
+        try:
+            return bytes.fromhex(value)
+        except ValueError:
+            raise _invalid(name + ' must be a SHA-256 hex string') from None
+
+    archive_id = _hex_256(resume_from.get('archive_id'), 'archive_id')
+    chain = _hex_256(resume_from.get('stream_digest'), 'stream_digest')
+
+    members_completed = resume_from.get('members_completed')
+    if type(members_completed) is not int or members_completed < 0:
+        raise _invalid('members_completed must be a non-negative integer')
+
+    last_member = resume_from.get('last_member')
+    if last_member is not None:
+        if not isinstance(last_member, dict):
+            raise _invalid('last_member must be a mapping or null')
+        name_hex = last_member.get('name_hex')
+        if not isinstance(name_hex, str):
+            raise _invalid('last_member.name_hex must be a hex string')
+        try:
+            bytes.fromhex(name_hex)
+        except ValueError:
+            raise _invalid('last_member.name_hex must be a hex string') from None
+        crc_32 = last_member.get('crc_32')
+        if type(crc_32) is not int or not 0 <= crc_32 <= 0xFFFFFFFF:
+            raise _invalid('last_member.crc_32 must be a 32-bit unsigned integer')
+        for size_name in ('compressed_size', 'uncompressed_size'):
+            size = last_member.get(size_name)
+            if size is not None and (type(size) is not int or size < 0):
+                raise _invalid('last_member.' + size_name + ' must be a non-negative integer or null')
+
+    return offset, archive_id.hex(), chain, members_completed, last_member
+
+
+class RecoveryPointExporter:
+    # Passed to stream_unzip via its recovery_point_exporter argument. While consuming
+    # the archive, call export() after a member has been fully consumed to get a
+    # recovery point for the boundary that follows it
+    def __init__(self):
+        self._current = None
+
+    def _set_current(self, current):
+        self._current = current
+
+    def export(self):
+        if self._current is None:
+            raise RecoveryPointNotAvailableError('No member boundary has been verified, so no recovery point is available')
+        return self._current()
+
+
+class _StreamTracker:
+    # Tracks the compressed bytes consumed from the archive so recovery points can
+    # commit to them. Bytes are hashed into the current segment only once they can
+    # no longer be returned to the stream (a bounded number of the most recent bytes
+    # is kept un-hashed), so pre-read bytes that are handed back are never committed
+    def __init__(self, chunk_size, chain=b'', archive_id=None, start_offset=0):
+        self._pending_limit = 4 * chunk_size + 128
+        self._segment_hasher = hashlib.sha256()
+        self._pending = bytearray()
+        self._chain = chain
+        self._archive_id = archive_id
+        self._identity_buffer = bytearray() if archive_id is None else None
+        self._position = start_offset
+
+    def consume(self, data):
+        self._pending += data
+        self._position += len(data)
+
+        if self._identity_buffer is not None and len(self._identity_buffer) < archive_identity_size:
+            self._identity_buffer += data[:archive_identity_size - len(self._identity_buffer)]
+
+        overflow = len(self._pending) - self._pending_limit
+        if overflow > 0:
+            self._segment_hasher.update(self._pending[:overflow])
+            del self._pending[:overflow]
+
+    def unconsume(self, num):
+        if not num:
+            return
+        if num > len(self._pending):
+            raise UnzipError('Cannot return bytes that have already been committed to the stream digest')
+        del self._pending[len(self._pending) - num:]
+        self._position -= num
+        if self._identity_buffer is not None and len(self._identity_buffer) > self._position:
+            del self._identity_buffer[self._position:]
+
+    def archive_id(self):
+        if self._archive_id is not None:
+            return self._archive_id
+        if len(self._identity_buffer) == archive_identity_size:
+            return hashlib.sha256(bytes(self._identity_buffer)).hexdigest()
+        return None
+
+    def close_segment(self):
+        segment_hasher = self._segment_hasher.copy()
+        segment_hasher.update(self._pending)
+        self._chain = hashlib.sha256(self._chain + segment_hasher.digest()).digest()
+        self._segment_hasher = hashlib.sha256()
+        self._pending = bytearray()
+
+    def chain_hex(self):
+        return self._chain.hex()
+
+
+def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True,
+                 recovery_point_exporter=None, resume_from=None, archive_id=None):
     local_file_header_signature = b'PK\x03\x04'
     local_file_header_struct = Struct('<H2sHHHIIIHH')
     zip64_compressed_size = 0xFFFFFFFF
@@ -29,13 +188,39 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
     dd_struct_64 = Struct('<0sIQQ4s')
     dd_struct_64_with_sig = Struct('<4sIQQ4s')
 
+    resume_offset = 0
+    resume_archive_id = None
+    resume_chain = b''
+    resume_members_completed = 0
+    resume_last_member = None
+
+    if resume_from is not None:
+        resume_offset, resume_archive_id, resume_chain, resume_members_completed, resume_last_member = \
+            _parse_recovery_point(resume_from)
+
+        # The caller is responsible for supplying a byte source that starts at the
+        # recovery point's offset, and for proving it is from the same archive by
+        # supplying the identity of the original archive
+        if archive_id is None:
+            raise ArchiveIdentityMismatchError('archive_id is required when resuming, to prove the byte source is from the same archive as the recovery point')
+        if archive_id != resume_archive_id:
+            raise ArchiveIdentityMismatchError('archive_id does not match the identity stored in the recovery point')
+    elif archive_id is not None:
+        raise InvalidRecoveryPointError('archive_id can only be supplied together with resume_from')
+
+    boundary_state = {
+        'offset': None,
+        'members_completed': resume_members_completed,
+        'last_member': resume_last_member,
+    }
+
     def next_or_truncated_error(it):
         try:
             return next(it)
         except StopIteration:
             raise TruncatedDataError from None
 
-    def get_byte_readers(iterable):
+    def get_byte_readers(iterable, tracker=None, start_offset=0):
         # Return functions to return/"replace" bytes from/to the iterable
         # - _yield_all: yields chunks as they come up (often for a "body")
         # - _get_num: returns a single `bytes` of a given length
@@ -45,7 +230,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         chunk = b''
         offset = 0
-        offset_from_start = 0
+        offset_from_start = start_offset
         queue = list()  # Will typically have at most 1 element, so a list is fine
         it = iter(iterable)
 
@@ -65,7 +250,10 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
                 offset = offset + to_yield
                 num -= to_yield
                 offset_from_start += to_yield
-                yield chunk[offset - to_yield:offset]
+                yielded = chunk[offset - to_yield:offset]
+                if tracker is not None:
+                    tracker.consume(yielded)
+                yield yielded
 
         def _yield_all():
             try:
@@ -80,6 +268,8 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             nonlocal offset, offset_from_start
             offset -= num_unused
             offset_from_start -= num_unused
+            if tracker is not None:
+                tracker.unconsume(num_unused)
 
         def _return_bytes_unused(bytes_unused):
             nonlocal chunk, offset, offset_from_start
@@ -87,6 +277,8 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             chunk = bytes_unused
             offset = 0
             offset_from_start -= len(bytes_unused)
+            if tracker is not None:
+                tracker.unconsume(len(bytes_unused))
 
         def _get_offset_from_start():
             return offset_from_start
@@ -175,7 +367,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         return _decompress, _is_done, _num_unused
 
-    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start):
+    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, boundary_reached=None):
 
         def get_flag_bits(flags):
             for b in flags:
@@ -316,6 +508,9 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             if uncompressed_size_data != uncompressed_size:
                 raise UncompressedSizeIntegrityError()
 
+            if boundary_reached is not None:
+                boundary_reached(file_name, crc_32_data, compressed_size_data, uncompressed_size_data)
+
         def checked_from_data_descriptor(chunks, is_sure_zip64, is_aes_2_encrypted, get_crc_32, get_compressed_size, get_uncompressed_size):
             # The format of the data descriptor is unfortunately not known with absolute certainty in all cases
             # so we we use a heuristic to detect it - using the known crc32 value, compressed size, uncompressed
@@ -373,6 +568,9 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
                 raise UnexpectedSignatureError(next_signature)
 
             return_bytes_unused(dd[dd_struct.size - 4:])  # 4 is the length of next signature we have already taken
+
+            if boundary_reached is not None:
+                boundary_reached(file_name, crc_32_data, compressed_size_data, uncompressed_size_data)
 
         version, flags, compression_raw, mod_time, mod_date, crc_32_expected, compressed_size_raw, uncompressed_size_raw, file_name_len, extra_field_len = \
             local_file_header_struct.unpack(get_num(local_file_header_struct.size))
@@ -445,12 +643,52 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
         return file_name, uncompressed_size, checked_bytes
 
     def all():
-        yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = get_byte_readers(zipfile_chunks)
+        tracker = \
+            _StreamTracker(chunk_size, chain=resume_chain, archive_id=resume_archive_id, start_offset=resume_offset) \
+            if recovery_point_exporter is not None else \
+            None
+
+        yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = \
+            get_byte_readers(zipfile_chunks, tracker=tracker, start_offset=resume_offset)
+
+        def boundary_reached(file_name, crc_32, compressed_size, uncompressed_size):
+            # The member, including any data descriptor, has been fully consumed and
+            # verified, and the offset is exactly at the boundary that follows it
+            tracker.close_segment()
+            boundary_state['offset'] = get_offset_from_start()
+            boundary_state['members_completed'] += 1
+            boundary_state['last_member'] = {
+                'name_hex': file_name.hex(),
+                'crc_32': crc_32,
+                'compressed_size': compressed_size,
+                'uncompressed_size': uncompressed_size,
+            }
+
+        if recovery_point_exporter is not None:
+            def current_recovery_point():
+                if boundary_state['offset'] is None or boundary_state['offset'] != get_offset_from_start():
+                    raise RecoveryPointNotAvailableError('A recovery point can only be exported at a verified member boundary, after a member and any data descriptor have been fully consumed and verified')
+
+                current_archive_id = tracker.archive_id()
+                if current_archive_id is None:
+                    raise InsufficientArchiveIdentityError('Not enough of the archive has been consumed to establish its identity')
+
+                return {
+                    'format': recovery_point_format,
+                    'version': recovery_point_version,
+                    'offset': boundary_state['offset'],
+                    'archive_id': current_archive_id,
+                    'stream_digest': tracker.chain_hex(),
+                    'members_completed': boundary_state['members_completed'],
+                    'last_member': boundary_state['last_member'],
+                }
+
+            recovery_point_exporter._set_current(current_recovery_point)
 
         while True:
             signature = get_num(len(local_file_header_signature))
             if signature == local_file_header_signature:
-                yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start)
+                yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, boundary_reached if tracker is not None else None)
             elif signature in (central_directory_signature, end_of_central_directory_signature):
                 for _ in yield_all():
                     pass
@@ -516,7 +754,19 @@ class InvalidOperationError(UnzipError):
 class UnfinishedIterationError(InvalidOperationError):
     pass
 
+class RecoveryPointNotAvailableError(InvalidOperationError):
+    pass
+
+class InsufficientArchiveIdentityError(InvalidOperationError):
+    pass
+
 class UnzipValueError(UnzipError, ValueError):
+    pass
+
+class InvalidRecoveryPointError(UnzipValueError):
+    pass
+
+class ArchiveIdentityMismatchError(UnzipValueError):
     pass
 
 class DataError(UnzipValueError):

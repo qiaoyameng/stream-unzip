@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import itertools
 import io
+import json
 import platform
 import unittest
 import uuid
@@ -10,6 +12,9 @@ import zipfile
 from stream_unzip import (
     async_stream_unzip,
     stream_unzip,
+    RecoveryPointExporter,
+    recovery_point_to_json,
+    recovery_point_from_json,
     UnfinishedIterationError,
     TruncatedDataError,
     UnsupportedFlagsError,
@@ -18,6 +23,10 @@ from stream_unzip import (
     UnexpectedSignatureError,
     HMACIntegrityError,
     CRC32IntegrityError,
+    RecoveryPointNotAvailableError,
+    InsufficientArchiveIdentityError,
+    InvalidRecoveryPointError,
+    ArchiveIdentityMismatchError,
     MissingZipCryptoPasswordError,
     MissingAESPasswordError,
     IncorrectZipCryptoPasswordError,
@@ -749,6 +758,372 @@ class TestStreamUnzip(unittest.TestCase):
             for name, size, chunks in stream_unzip(yield_input()):
                 for chunk in chunks:
                     pass
+
+    def test_recovery_point_resume(self):
+        rnd = random.Random()
+        rnd.seed(1)
+
+        names = [b'first.txt', b'second.txt', b'third.txt', b'fourth.txt']
+        contents = [
+            bytes(rnd.getrandbits(8) for _ in range(0, 6400)),
+            b'',
+            b'small',
+            bytes(rnd.getrandbits(8) for _ in range(0, 96000)),
+        ]
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for name, content in zip(names, contents):
+                zf.writestr(name.decode(), content)
+        zip_bytes = file.getvalue()
+
+        def yield_input(input_size, start=0):
+            for i in range(start, len(zip_bytes), input_size):
+                yield zip_bytes[i:i + input_size]
+
+        def run(input_size, start=0, **kwargs):
+            exporter = RecoveryPointExporter()
+            results = []
+            recovery_points = []
+            for name, size, chunks in stream_unzip(yield_input(input_size, start), chunk_size=13, recovery_point_exporter=exporter, **kwargs):
+                results.append((name, size, b''.join(chunks)))
+                recovery_points.append(exporter.export())
+            return results, recovery_points
+
+        # Full run, with input chunks small enough that they often straddle member boundaries
+        results, recovery_points = run(7)
+
+        self.assertEqual([result[0] for result in results], names)
+        self.assertEqual([result[2] for result in results], contents)
+        self.assertEqual(len(recovery_points), len(names))
+
+        expected_archive_id = hashlib.sha256(zip_bytes[:4096]).hexdigest()
+        for i, recovery_point in enumerate(recovery_points):
+            # Each recovery point is JSON-serialisable without pickle, identifies the
+            # archive, and its offset is exactly on the next member or central directory
+            json.dumps(recovery_point)
+            self.assertEqual(recovery_point['archive_id'], expected_archive_id)
+            self.assertEqual(recovery_point['members_completed'], i + 1)
+            self.assertIn(zip_bytes[recovery_point['offset']:recovery_point['offset'] + 4], (b'PK\x03\x04', b'PK\x01\x02'))
+
+        # Saved offsets must not depend on input chunking: when a chunk contains the
+        # tail of one member and the head of the next, pre-read bytes are returned
+        # to the stream rather than lost
+        for input_size in (1, 3, 65536, len(zip_bytes)):
+            with self.subTest(input_size=input_size):
+                other_results, other_recovery_points = run(input_size)
+                self.assertEqual(other_results, results)
+                self.assertEqual(other_recovery_points, recovery_points)
+
+        # Interrupt after each member in turn and rebuild from the recovery point,
+        # comparing the remaining output and the final verification state
+        for i, recovery_point in enumerate(recovery_points):
+            with self.subTest(interrupted_after=i):
+                resumed_results, resumed_recovery_points = run(
+                    11,
+                    start=recovery_point['offset'],
+                    resume_from=recovery_point,
+                    archive_id=expected_archive_id,
+                )
+                self.assertEqual(resumed_results, results[i + 1:])
+                self.assertEqual(resumed_recovery_points, recovery_points[i + 1:])
+
+    def test_recovery_point_resume_with_data_descriptors(self):
+        rnd = random.Random()
+        rnd.seed(2)
+
+        class UnseekableBytesIO(io.BytesIO):
+            def seekable(self):
+                return False
+
+            def seek(self, *args, **kwargs):
+                raise io.UnsupportedOperation
+
+        names = [b'first.txt', b'second.txt', b'third.txt']
+        contents = [
+            bytes(rnd.getrandbits(8) for _ in range(0, 5000)),
+            bytes(rnd.getrandbits(8) for _ in range(0, 100)),
+            bytes(rnd.getrandbits(8) for _ in range(0, 70000)),
+        ]
+
+        file = UnseekableBytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for name, content in zip(names, contents):
+                zf.writestr(name.decode(), content)
+        zip_bytes = file.getvalue()
+
+        # Sanity check that the archive really uses data descriptors
+        self.assertTrue(zip_bytes[6] & 0x08)
+        self.assertIn(b'PK\x07\x08', zip_bytes)
+
+        def yield_input(input_size, start=0):
+            for i in range(start, len(zip_bytes), input_size):
+                yield zip_bytes[i:i + input_size]
+
+        def run(input_size, start=0, **kwargs):
+            exporter = RecoveryPointExporter()
+            results = []
+            recovery_points = []
+            for name, size, chunks in stream_unzip(yield_input(input_size, start), chunk_size=13, recovery_point_exporter=exporter, **kwargs):
+                results.append((name, size, b''.join(chunks)))
+                recovery_points.append(exporter.export())
+            return results, recovery_points
+
+        results, recovery_points = run(7)
+
+        self.assertEqual([result[0] for result in results], names)
+        self.assertEqual([result[2] for result in results], contents)
+
+        expected_archive_id = hashlib.sha256(zip_bytes[:4096]).hexdigest()
+        for recovery_point in recovery_points:
+            self.assertEqual(recovery_point['archive_id'], expected_archive_id)
+            self.assertIn(zip_bytes[recovery_point['offset']:recovery_point['offset'] + 4], (b'PK\x03\x04', b'PK\x01\x02'))
+
+        # The data descriptor is parsed by reading ahead into the next member's
+        # header, so large input chunks exercise the return of pre-read bytes
+        for input_size in (1, 65536, len(zip_bytes)):
+            with self.subTest(input_size=input_size):
+                other_results, other_recovery_points = run(input_size)
+                self.assertEqual(other_results, results)
+                self.assertEqual(other_recovery_points, recovery_points)
+
+        for i, recovery_point in enumerate(recovery_points):
+            with self.subTest(interrupted_after=i):
+                resumed_results, resumed_recovery_points = run(
+                    11,
+                    start=recovery_point['offset'],
+                    resume_from=recovery_point,
+                    archive_id=expected_archive_id,
+                )
+                self.assertEqual(resumed_results, results[i + 1:])
+                self.assertEqual(resumed_recovery_points, recovery_points[i + 1:])
+
+    def test_recovery_point_chained_resume(self):
+        rnd = random.Random()
+        rnd.seed(3)
+
+        names = [b'first.txt', b'second.txt', b'third.txt']
+        contents = [bytes(rnd.getrandbits(8) for _ in range(0, 5000)) for _ in names]
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for name, content in zip(names, contents):
+                zf.writestr(name.decode(), content)
+        zip_bytes = file.getvalue()
+
+        def run(start=0, **kwargs):
+            exporter = RecoveryPointExporter()
+            results = []
+            recovery_points = []
+            chunks = (zip_bytes[i:i + 7] for i in range(start, len(zip_bytes), 7))
+            for name, size, member_chunks in stream_unzip(chunks, recovery_point_exporter=exporter, **kwargs):
+                results.append((name, size, b''.join(member_chunks)))
+                recovery_points.append(exporter.export())
+            return results, recovery_points
+
+        results, recovery_points = run()
+        expected_archive_id = hashlib.sha256(zip_bytes[:4096]).hexdigest()
+
+        # Resume from the first boundary, then resume again from a recovery point
+        # exported by the resumed run itself
+        first_resumed_results, first_resumed_recovery_points = run(
+            start=recovery_points[0]['offset'],
+            resume_from=recovery_points[0],
+            archive_id=expected_archive_id,
+        )
+        self.assertEqual(first_resumed_results, results[1:])
+        self.assertEqual(first_resumed_recovery_points, recovery_points[1:])
+
+        second_resumed_results, second_resumed_recovery_points = run(
+            start=first_resumed_recovery_points[0]['offset'],
+            resume_from=first_resumed_recovery_points[0],
+            archive_id=expected_archive_id,
+        )
+        self.assertEqual(second_resumed_results, results[2:])
+        self.assertEqual(second_resumed_recovery_points, recovery_points[2:])
+
+    def test_recovery_point_not_available(self):
+        rnd = random.Random()
+        rnd.seed(4)
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+            zf.writestr('second.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+        zip_bytes = file.getvalue()
+
+        # Before the exporter is attached to a run
+        with self.assertRaises(RecoveryPointNotAvailableError):
+            RecoveryPointExporter().export()
+
+        # Before any member boundary has been verified
+        exporter = RecoveryPointExporter()
+        it = stream_unzip([zip_bytes], recovery_point_exporter=exporter)
+        name, size, chunks = next(it)
+        with self.assertRaises(RecoveryPointNotAvailableError):
+            exporter.export()
+
+        # In the middle of a member, its data descriptor (or trailer checks) are
+        # not yet complete, so there is no verified boundary
+        next(chunks)
+        with self.assertRaises(RecoveryPointNotAvailableError):
+            exporter.export()
+
+        # At the boundary after the member, export is allowed
+        for _ in chunks:
+            pass
+        exporter.export()
+
+        # Once the next member has started, the boundary has been passed
+        name, size, chunks = next(it)
+        with self.assertRaises(RecoveryPointNotAvailableError):
+            exporter.export()
+
+        # After the archive has been fully consumed, the boundary has been passed
+        for _ in chunks:
+            pass
+        for name, size, chunks in it:
+            for _ in chunks:
+                pass
+        with self.assertRaises(RecoveryPointNotAvailableError):
+            exporter.export()
+
+    def test_recovery_point_insufficient_identity(self):
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', b'short')
+            zf.writestr('second.txt', b'also short')
+        zip_bytes = file.getvalue()
+
+        # The archive is smaller than the prefix used to establish its identity,
+        # so no recovery point can be exported even at verified member boundaries
+        exporter = RecoveryPointExporter()
+        num_members = 0
+        for name, size, chunks in stream_unzip([zip_bytes], recovery_point_exporter=exporter):
+            num_members += 1
+            for _ in chunks:
+                pass
+            with self.assertRaises(InsufficientArchiveIdentityError):
+                exporter.export()
+        self.assertEqual(num_members, 2)
+
+    def test_recovery_point_identity_mismatch(self):
+        rnd = random.Random()
+        rnd.seed(5)
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+            zf.writestr('second.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+        zip_bytes = file.getvalue()
+
+        exporter = RecoveryPointExporter()
+        for name, size, chunks in stream_unzip([zip_bytes], recovery_point_exporter=exporter):
+            for _ in chunks:
+                pass
+            recovery_point = exporter.export()
+            break
+
+        tail = zip_bytes[recovery_point['offset']:]
+
+        # Resuming requires the caller to prove the identity of the original archive
+        with self.assertRaises(ArchiveIdentityMismatchError):
+            list(stream_unzip([tail], resume_from=recovery_point))
+
+        with self.assertRaises(ArchiveIdentityMismatchError):
+            list(stream_unzip([tail], resume_from=recovery_point, archive_id='00' * 32))
+
+        # archive_id is only meaningful when resuming
+        with self.assertRaises(InvalidRecoveryPointError):
+            list(stream_unzip([zip_bytes], archive_id=recovery_point['archive_id']))
+
+        # With matching identity, resuming works
+        results = [
+            (name, size, b''.join(chunks))
+            for name, size, chunks in stream_unzip([tail], resume_from=recovery_point, archive_id=recovery_point['archive_id'])
+        ]
+        self.assertEqual([result[0] for result in results], [b'second.txt'])
+
+    def test_invalid_recovery_point(self):
+        rnd = random.Random()
+        rnd.seed(6)
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+            zf.writestr('second.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+        zip_bytes = file.getvalue()
+
+        exporter = RecoveryPointExporter()
+        for name, size, chunks in stream_unzip([zip_bytes], recovery_point_exporter=exporter):
+            for _ in chunks:
+                pass
+            recovery_point = exporter.export()
+            break
+
+        archive_id = recovery_point['archive_id']
+        tail = zip_bytes[recovery_point['offset']:]
+
+        invalid_recovery_points = [
+            'not json',
+            b'{not json',
+            42,
+            ['not', 'a', 'mapping'],
+            {},
+            dict(recovery_point, format='something-else'),
+            dict(recovery_point, version=2),
+            dict(recovery_point, offset=-1),
+            dict(recovery_point, offset='not-an-int'),
+            dict(recovery_point, archive_id='not-hex'),
+            dict(recovery_point, archive_id='abcd'),
+            dict(recovery_point, stream_digest='not-hex'),
+            dict(recovery_point, members_completed=-1),
+            dict(recovery_point, members_completed='1'),
+            dict(recovery_point, last_member='not-a-mapping'),
+            dict(recovery_point, last_member=dict(recovery_point['last_member'], name_hex='not-hex')),
+            dict(recovery_point, last_member=dict(recovery_point['last_member'], crc_32=-1)),
+            dict(recovery_point, last_member=dict(recovery_point['last_member'], compressed_size='1')),
+        ]
+        for invalid_recovery_point in invalid_recovery_points:
+            with self.subTest(recovery_point=invalid_recovery_point):
+                with self.assertRaises(InvalidRecoveryPointError):
+                    list(stream_unzip([tail], resume_from=invalid_recovery_point, archive_id=archive_id))
+
+    def test_recovery_point_json(self):
+        rnd = random.Random()
+        rnd.seed(7)
+
+        file = io.BytesIO()
+        with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('first.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+            zf.writestr('second.txt', bytes(rnd.getrandbits(8) for _ in range(0, 5000)))
+        zip_bytes = file.getvalue()
+
+        exporter = RecoveryPointExporter()
+        for name, size, chunks in stream_unzip([zip_bytes], recovery_point_exporter=exporter):
+            for _ in chunks:
+                pass
+            recovery_point = exporter.export()
+            break
+
+        # The recovery point survives a JSON round trip, and can be resumed from
+        # directly in its JSON form
+        recovery_point_json = recovery_point_to_json(recovery_point)
+        self.assertEqual(recovery_point_from_json(recovery_point_json), recovery_point)
+        self.assertEqual(recovery_point_from_json(recovery_point_json.encode()), recovery_point)
+
+        tail = zip_bytes[recovery_point['offset']:]
+        results = [
+            (name, size, b''.join(chunks))
+            for name, size, chunks in stream_unzip([tail], resume_from=recovery_point_json, archive_id=recovery_point['archive_id'])
+        ]
+        self.assertEqual([result[0] for result in results], [b'second.txt'])
+
+        with self.assertRaises(InvalidRecoveryPointError):
+            recovery_point_from_json('not json')
+
+        with self.assertRaises(InvalidRecoveryPointError):
+            recovery_point_from_json('"just a string"')
 
     def test_async_stream_unzip(self):
         async def async_bytes():

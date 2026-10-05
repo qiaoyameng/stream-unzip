@@ -20,9 +20,25 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
 
             The unzipped chunks iterator of a member file has not been iterated to completion.
 
+        - **RecoveryPointNotAvailableError**
+
+            A recovery point was requested, but the stream is not at a verified member boundary.
+
+        - **InsufficientArchiveIdentityError**
+
+            A recovery point was requested, but not enough of the archive has been consumed to establish its identity.
+
     - **UnzipValueError** (also inherits from the **ValueError** built-in)
 
         Base class for errors relating to invalid arguments
+
+        - **InvalidRecoveryPointError**
+
+            A recovery point supplied to resume from is not valid.
+
+        - **ArchiveIdentityMismatchError**
+
+            The archive identity supplied when resuming does not match the identity stored in the recovery point.
 
         - **PasswordError**
 
