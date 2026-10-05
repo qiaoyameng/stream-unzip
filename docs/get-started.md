@@ -43,3 +43,31 @@ for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), passw
 ```
 
 The file name and file size are extracted as reported from the file. If you don't trust the creator of the ZIP file, these should be treated as untrusted input.
+
+
+## Structured member names
+
+By default the member name is yielded as the exact bytes from the local file header. To explicitly interpret CP437 names and Info-ZIP Unicode Path extra fields, pass `structured_member_names=True`. The first item yielded for each member is then a `MemberName` named tuple.
+
+```python
+from stream_unzip import stream_unzip
+
+for member_name, file_size, unzipped_chunks in stream_unzip(
+        zipped_chunks(),
+        structured_member_names=True,
+        invalid_member_names='strict'):
+    print(member_name.raw_name)
+    print(member_name.text)
+    print(member_name.source)
+    print(member_name.status)
+    print(member_name.reasons)
+```
+
+`invalid_member_names` can be:
+
+- `'strict'`, the default, to raise an exception for invalid UTF-8, an unsupported Unicode Path version, an incorrect original-name CRC, or conflicting or duplicate Unicode Path extra fields.
+- `'preserve'`, to keep the local-header name. The result has `status='preserved'`, and `reasons` describes why the Unicode Path extra field was not accepted.
+
+The UTF-8 general-purpose bit is respected. When it is set and a Unicode Path extra field is also present, the extra field can corroborate the header name, but cannot override it. When it is not set, a valid version-1 Unicode Path extra field with a matching CRC and valid UTF-8 is used.
+
+`member_name.normalized_key` is provided only for detecting names that are visually or case equivalent. It is NFC-normalized and case-folded bytes. The real `text`, `raw_name`, and `used_name_bytes` are not normalized, directories are not removed, and no name is written to or otherwise converted to a local filesystem path.

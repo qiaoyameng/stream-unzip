@@ -125,3 +125,23 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
                 - **InvalidAESKeyLengthError**
 
                     AES key length specified in the ZIP is not any of 1, 2, or 3 (which correspond to 128, 192, and 256 bits respectively).
+
+            - **InvalidMemberNameError**
+
+                A member name or Unicode Path extra field could not be interpreted according to the strict member-name rules.
+
+                - **InvalidMemberNameEncodingError**
+
+                    The member name bytes are not valid for the encoding implied by the UTF-8 flag.
+
+                - **InvalidUnicodePathExtraError**
+
+                    The Unicode Path extra field is invalid, for example because its version, original-name CRC, or UTF-8 name is invalid.
+
+                    - **DuplicateUnicodePathExtraError**
+
+                        More than one Unicode Path extra field is present.
+
+                    - **ConflictingUnicodePathExtraError**
+
+                        A Unicode Path extra field conflicts with the member name marked as UTF-8.

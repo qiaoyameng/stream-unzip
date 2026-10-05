@@ -1,7 +1,9 @@
+from collections import namedtuple
 from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import unicodedata
 import zlib
 
 from Crypto.Cipher import AES
@@ -12,7 +14,247 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
+UTF8_NAME_FLAG = 0x0800
+UNICODE_PATH_EXTRA_SIGNATURE = b'\x75\x70'
+UNICODE_PATH_EXTRA_VERSION = 1
+
+MemberName = namedtuple('MemberName', (
+    'raw_name',
+    'text',
+    'source',
+    'encoding',
+    'used_name_bytes',
+    'normalized_key',
+    'status',
+    'reasons',
+    'unicode_path_extra',
+))
+
+UnicodePathExtra = namedtuple('UnicodePathExtra', (
+    'version',
+    'name_crc32',
+    'expected_name_crc32',
+    'raw_name',
+    'name',
+))
+
+
+def parse_extra_fields(extra):
+    fields = []
+    offset = 0
+
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise TruncatedExtraError('truncated-extra-field')
+
+        signature = extra[offset:offset + 2]
+        field_size = Struct('<H').unpack(extra[offset + 2:offset + 4])[0]
+        data_start = offset + 4
+        data_end = data_start + field_size
+
+        if data_end > len(extra):
+            raise TruncatedExtraError('truncated-extra-field')
+
+        fields.append((signature, extra[data_start:data_end]))
+        offset = data_end
+
+    return fields
+
+
+def normalized_member_name_key(name):
+    normalized = unicodedata.normalize('NFC', name).casefold()
+    return normalized.encode('utf-8')
+
+
+def parse_member_name(raw_name, flags, extra, on_invalid='strict'):
+    if on_invalid not in ('strict', 'preserve'):
+        raise ValueError("on_invalid must be 'strict' or 'preserve'")
+
+    if isinstance(flags, bytes):
+        flags = Struct('<H').unpack(flags)[0]
+
+    reasons = []
+
+    try:
+        extra_fields = parse_extra_fields(extra)
+    except TruncatedExtraError:
+        extra_fields = []
+        reasons.append('truncated-extra-field')
+
+    unicode_fields = [
+        data for signature, data in extra_fields
+        if signature == UNICODE_PATH_EXTRA_SIGNATURE
+    ]
+
+    candidates = []
+    for field_data in unicode_fields:
+        candidate_reasons = []
+
+        if len(field_data) < 5:
+            candidate_reasons.append('truncated-unicode-path-extra')
+            candidates.append((None, None, None, b'', None, candidate_reasons))
+            continue
+
+        version = field_data[0]
+        stored_crc32 = Struct('<I').unpack(field_data[1:5])[0]
+        candidate_raw_name = field_data[5:]
+        expected_crc32 = zlib.crc32(raw_name) & 0xffffffff
+
+        if version != UNICODE_PATH_EXTRA_VERSION:
+            candidate_reasons.append('unsupported-unicode-path-extra-version')
+
+        try:
+            candidate_name = candidate_raw_name.decode('utf-8')
+        except UnicodeDecodeError:
+            candidate_name = None
+            candidate_reasons.append('invalid-unicode-path-utf-8')
+
+        if stored_crc32 != expected_crc32:
+            candidate_reasons.append('unicode-path-name-crc-mismatch')
+
+        candidates.append((
+            expected_crc32,
+            version,
+            stored_crc32,
+            candidate_raw_name,
+            candidate_name,
+            candidate_reasons,
+        ))
+
+    if len(unicode_fields) > 1:
+        reasons.append('duplicate-unicode-path-extra')
+
+    raw_encoding = None
+    try:
+        if flags & UTF8_NAME_FLAG:
+            raw_name_text = raw_name.decode('utf-8')
+            raw_encoding = 'utf-8'
+        else:
+            raw_name_text = raw_name.decode('cp437')
+            raw_encoding = 'cp437'
+    except UnicodeDecodeError:
+        raw_name_text = None
+        reasons.append('invalid-member-name-encoding')
+
+    source = None
+    encoding = None
+    used_name_bytes = None
+    text = None
+    unicode_path_extra = None
+
+    if not reasons and len(candidates) == 1:
+        expected_crc32, version, stored_crc32, candidate_raw_name, candidate_name, candidate_reasons = candidates[0]
+
+        if candidate_reasons:
+            reasons.extend(candidate_reasons)
+        elif flags & UTF8_NAME_FLAG:
+            if candidate_name == raw_name_text:
+                source = 'utf-8-flag'
+                encoding = 'utf-8'
+                used_name_bytes = raw_name
+                text = raw_name_text
+                unicode_path_extra = UnicodePathExtra(
+                    version,
+                    stored_crc32,
+                    expected_crc32,
+                    candidate_raw_name,
+                    candidate_name,
+                )
+            else:
+                reasons.append('conflicting-unicode-path-extra')
+        else:
+            source = 'unicode-path-extra'
+            encoding = 'utf-8'
+            used_name_bytes = candidate_raw_name
+            text = candidate_name
+            unicode_path_extra = UnicodePathExtra(
+                version,
+                stored_crc32,
+                expected_crc32,
+                candidate_raw_name,
+                candidate_name,
+            )
+
+    if not reasons and not candidates and raw_name_text is not None:
+        source = 'utf-8-flag' if flags & UTF8_NAME_FLAG else 'cp437'
+        encoding = raw_encoding
+        used_name_bytes = raw_name
+        text = raw_name_text
+
+    if not reasons and text is None:
+        reasons.append('invalid-member-name-encoding')
+
+    reasons = tuple(dict.fromkeys(reasons))
+
+    if reasons:
+        if on_invalid == 'preserve':
+            if raw_name_text is None or raw_encoding is None:
+                preserved_source = 'raw'
+                preserved_encoding = None
+                preserved_text = None
+                preserved_key = raw_name
+            else:
+                preserved_source = 'utf-8-flag' if flags & UTF8_NAME_FLAG else 'cp437'
+                preserved_encoding = raw_encoding
+                preserved_text = raw_name_text
+                preserved_key = normalized_member_name_key(raw_name_text)
+
+            return MemberName(
+                raw_name,
+                preserved_text,
+                preserved_source,
+                preserved_encoding,
+                raw_name,
+                preserved_key,
+                'preserved',
+                reasons,
+                None,
+            )
+
+        reason = reasons[0]
+        if reason == 'truncated-extra-field':
+            exception = TruncatedExtraError
+        elif reason == 'duplicate-unicode-path-extra':
+            exception = DuplicateUnicodePathExtraError
+        elif reason == 'conflicting-unicode-path-extra':
+            exception = ConflictingUnicodePathExtraError
+        elif reason == 'invalid-member-name-encoding':
+            exception = InvalidMemberNameEncodingError
+        else:
+            exception = InvalidUnicodePathExtraError
+
+        raise exception('Invalid member name {!r}: {}'.format(raw_name, ', '.join(reasons)))
+
+    if source == 'unicode-path-extra':
+        accepted_reasons = ('unicode-path-extra',)
+    elif unicode_path_extra is not None:
+        accepted_reasons = ('utf-8-flag', 'unicode-path-extra-agrees')
+    elif encoding == 'utf-8':
+        accepted_reasons = ('utf-8-flag',)
+    else:
+        accepted_reasons = ('cp437-fallback',)
+
+    return MemberName(
+        raw_name,
+        text,
+        source,
+        encoding,
+        used_name_bytes,
+        normalized_member_name_key(text),
+        'accepted',
+        accepted_reasons,
+        unicode_path_extra,
+    )
+
+
+def stream_unzip(
+    zipfile_chunks,
+    password=None,
+    chunk_size=65536,
+    allow_zip64=True,
+    structured_member_names=False,
+    invalid_member_names='strict',
+):
     local_file_header_signature = b'PK\x03\x04'
     local_file_header_struct = Struct('<H2sHHHIIIHH')
     zip64_compressed_size = 0xFFFFFFFF
@@ -387,7 +629,15 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnsupportedFlagsError(flag_bits)
 
         file_name = get_num(file_name_len)
-        extra = dict(parse_extra(get_num(extra_field_len)))
+        extra_raw = get_num(extra_field_len)
+        extra = dict(parse_extra(extra_raw))
+        if structured_member_names:
+            file_name = parse_member_name(
+                file_name,
+                flags,
+                extra_raw,
+                on_invalid=invalid_member_names,
+            )
 
         is_weak_encrypted = flag_bits[0] and compression_raw != 99
         is_aes_encrypted = flag_bits[0] and compression_raw == 99
@@ -568,6 +818,21 @@ class InvalidExtraError(TruncatedExtraError):
     pass
 
 class InvalidAESKeyLengthError(TruncatedExtraError):
+    pass
+
+class InvalidMemberNameError(DataError):
+    pass
+
+class InvalidMemberNameEncodingError(InvalidMemberNameError):
+    pass
+
+class InvalidUnicodePathExtraError(InvalidMemberNameError):
+    pass
+
+class DuplicateUnicodePathExtraError(InvalidUnicodePathExtraError):
+    pass
+
+class ConflictingUnicodePathExtraError(InvalidUnicodePathExtraError):
     pass
 
 class IntegrityError(DataError):

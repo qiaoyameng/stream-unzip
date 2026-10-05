@@ -2,14 +2,25 @@ import asyncio
 import itertools
 import io
 import platform
+import unicodedata
 import unittest
 import uuid
 import random
+from struct import Struct
+import zlib
 import zipfile
 
 from stream_unzip import (
+    MemberName,
+    UnicodePathExtra,
     async_stream_unzip,
+    normalized_member_name_key,
+    parse_member_name,
     stream_unzip,
+    InvalidMemberNameEncodingError,
+    InvalidUnicodePathExtraError,
+    DuplicateUnicodePathExtraError,
+    ConflictingUnicodePathExtraError,
     UnfinishedIterationError,
     TruncatedDataError,
     UnsupportedFlagsError,
@@ -27,6 +38,205 @@ from stream_unzip import (
 
 
 class TestStreamUnzip(unittest.TestCase):
+
+    def test_structured_member_name_accepts_utf8_flag_and_matching_unicode_extra(self):
+        name = 'café.txt'
+        raw_name = name.encode('utf-8')
+        unicode_extra = b'\x01' + Struct('<I').pack(zlib.crc32(raw_name) & 0xffffffff) + raw_name
+
+        result = parse_member_name(raw_name, 0x0800, b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra)
+
+        self.assertIsInstance(result, MemberName)
+        self.assertEqual(result.raw_name, raw_name)
+        self.assertEqual(result.text, name)
+        self.assertEqual(result.source, 'utf-8-flag')
+        self.assertEqual(result.encoding, 'utf-8')
+        self.assertEqual(result.used_name_bytes, raw_name)
+        self.assertEqual(result.status, 'accepted')
+        self.assertEqual(result.reasons, ('utf-8-flag', 'unicode-path-extra-agrees'))
+        self.assertEqual(result.unicode_path_extra, UnicodePathExtra(
+            1,
+            zlib.crc32(raw_name) & 0xffffffff,
+            zlib.crc32(raw_name) & 0xffffffff,
+            raw_name,
+            name,
+        ))
+
+    def test_structured_member_name_accepts_unicode_extra_with_cp437_header(self):
+        raw_name = 'café.txt'.encode('cp437')
+        unicode_name = 'café.txt'.encode('utf-8')
+        unicode_extra = b'\x01' + Struct('<I').pack(zlib.crc32(raw_name) & 0xffffffff) + unicode_name
+
+        result = parse_member_name(raw_name, 0, b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra)
+
+        self.assertEqual(result.text, 'café.txt')
+        self.assertEqual(result.source, 'unicode-path-extra')
+        self.assertEqual(result.encoding, 'utf-8')
+        self.assertEqual(result.used_name_bytes, unicode_name)
+        self.assertEqual(result.status, 'accepted')
+        self.assertEqual(result.reasons, ('unicode-path-extra',))
+
+    def test_structured_member_name_normalizes_only_conflict_key(self):
+        composed = 'é.txt'
+        decomposed = unicodedata.normalize('NFD', composed)
+
+        self.assertNotEqual(composed.encode('utf-8'), decomposed.encode('utf-8'))
+        self.assertEqual(
+            parse_member_name(composed.encode('utf-8'), 0x0800, b'').normalized_key,
+            parse_member_name(decomposed.encode('utf-8'), 0x0800, b'').normalized_key,
+        )
+        self.assertNotEqual(
+            parse_member_name(composed.encode('utf-8'), 0x0800, b'').text,
+            parse_member_name(decomposed.encode('utf-8'), 0x0800, b'').text,
+        )
+
+    def test_structured_member_name_rejects_or_preserves_invalid_unicode_extra(self):
+        raw_name = b'caf\x82.txt'
+        unicode_extra = b'\x01' + Struct('<I').pack(12345678) + 'café.txt'.encode('utf-8')
+        extra = b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra
+
+        with self.assertRaises(InvalidUnicodePathExtraError) as cm:
+            parse_member_name(raw_name, 0, extra)
+
+        self.assertIn('unicode-path-name-crc-mismatch', str(cm.exception))
+
+        result = parse_member_name(raw_name, 0, extra, on_invalid='preserve')
+        self.assertEqual(result.text, 'café.txt')
+        self.assertEqual(result.source, 'cp437')
+        self.assertEqual(result.encoding, 'cp437')
+        self.assertEqual(result.used_name_bytes, raw_name)
+        self.assertEqual(result.status, 'preserved')
+        self.assertEqual(result.reasons, ('unicode-path-name-crc-mismatch',))
+
+    def test_structured_member_name_rejects_or_preserves_conflicting_unicode_extra(self):
+        raw_name = 'café.txt'.encode('utf-8')
+        unicode_name = 'different.txt'.encode('utf-8')
+        unicode_extra = b'\x01' + Struct('<I').pack(zlib.crc32(raw_name) & 0xffffffff) + unicode_name
+        extra = b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra
+
+        with self.assertRaises(ConflictingUnicodePathExtraError):
+            parse_member_name(raw_name, 0x0800, extra)
+
+        result = parse_member_name(raw_name, 0x0800, extra, on_invalid='preserve')
+        self.assertEqual(result.text, 'café.txt')
+        self.assertEqual(result.source, 'utf-8-flag')
+        self.assertEqual(result.encoding, 'utf-8')
+        self.assertEqual(result.status, 'preserved')
+        self.assertEqual(result.reasons, ('conflicting-unicode-path-extra',))
+
+    def test_structured_member_name_rejects_or_preserves_duplicate_unicode_extra(self):
+        raw_name = b'caf\x82.txt'
+        unicode_name = 'café.txt'.encode('utf-8')
+        unicode_extra = b'\x01' + Struct('<I').pack(zlib.crc32(raw_name) & 0xffffffff) + unicode_name
+        extra_field = b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra
+
+        with self.assertRaises(DuplicateUnicodePathExtraError):
+            parse_member_name(raw_name, 0, extra_field + extra_field)
+
+        result = parse_member_name(raw_name, 0, extra_field + extra_field, on_invalid='preserve')
+        self.assertEqual(result.text, 'café.txt')
+        self.assertEqual(result.used_name_bytes, raw_name)
+        self.assertEqual(result.status, 'preserved')
+        self.assertIn('duplicate-unicode-path-extra', result.reasons)
+
+    def test_structured_member_name_rejects_or_preserves_invalid_utf8(self):
+        raw_name = b'\xff.txt'
+
+        with self.assertRaises(InvalidMemberNameEncodingError):
+            parse_member_name(raw_name, 0x0800, b'')
+
+        result = parse_member_name(raw_name, 0x0800, b'', on_invalid='preserve')
+        self.assertIsNone(result.text)
+        self.assertEqual(result.source, 'raw')
+        self.assertEqual(result.used_name_bytes, raw_name)
+        self.assertEqual(result.normalized_key, raw_name)
+        self.assertEqual(result.status, 'preserved')
+
+    def test_structured_member_name_rejects_or_preserves_bad_version_and_truncated_extra(self):
+        raw_name = b'caf\x82.txt'
+        unicode_name = 'café.txt'.encode('utf-8')
+        unicode_extra = b'\x02' + Struct('<I').pack(zlib.crc32(raw_name) & 0xffffffff) + unicode_name
+        extra = b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra
+
+        with self.assertRaises(InvalidUnicodePathExtraError) as cm:
+            parse_member_name(raw_name, 0, extra)
+
+        self.assertIn('unsupported-unicode-path-extra-version', str(cm.exception))
+
+        result = parse_member_name(raw_name, 0, b'\x75\x70\x04\x00\x01', on_invalid='preserve')
+        self.assertEqual(result.raw_name, raw_name)
+        self.assertEqual(result.used_name_bytes, raw_name)
+        self.assertEqual(result.status, 'preserved')
+        self.assertEqual(result.reasons, ('truncated-extra-field',))
+
+    def test_structured_member_name_from_stream_keeps_visually_similar_names_distinct(self):
+        composed = 'é.txt'.encode('utf-8')
+        decomposed = unicodedata.normalize('NFD', 'é.txt').encode('utf-8')
+
+        def local_header(name):
+            return (
+                b'PK\x03\x04'
+                + Struct('<H2sHHHIIIHH').pack(20, b'\x00\x08', 0, 0, 0, 0, 0, 0, len(name), 0)
+                + name
+            )
+
+        chunks = iter([local_header(composed), local_header(decomposed), b'PK\x01\x02'])
+
+        results = [
+            (name.raw_name, name.text, name.normalized_key, size)
+            for name, size, file_chunks in stream_unzip(chunks, structured_member_names=True)
+        ]
+
+        self.assertEqual(results[0][0], composed)
+        self.assertEqual(results[1][0], decomposed)
+        self.assertNotEqual(results[0][0], results[1][0])
+        self.assertEqual(results[0][2], results[1][2])
+
+    def test_structured_member_name_default_is_still_raw_bytes(self):
+        chunks = iter([
+            b'PK\x03\x04'
+            + Struct('<H2sHHHIIIHH').pack(20, b'\x00\x08', 0, 0, 0, 0, 0, 0, 7, 0)
+            + b'abc.txt',
+            b'PK\x01\x02',
+        ])
+
+        name, size, _ = next(stream_unzip(chunks))
+        self.assertEqual(name, b'abc.txt')
+
+    def test_structured_member_name_from_stream_preserves_crc_mismatch(self):
+        raw_name = b'caf\x82.txt'
+        unicode_name = 'café.txt'.encode('utf-8')
+        unicode_extra = b'\x01' + Struct('<I').pack(12345678) + unicode_name
+        extra = b'\x75\x70' + Struct('<H').pack(len(unicode_extra)) + unicode_extra
+
+        local_header = (
+            b'PK\x03\x04'
+            + Struct('<H2sHHHIIIHH').pack(
+                20,
+                b'\x00\x00',
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                len(raw_name),
+                len(extra),
+            )
+            + raw_name
+            + extra
+        )
+
+        name, size, _ = next(stream_unzip(
+            iter([local_header, b'PK\x01\x02']),
+            structured_member_names=True,
+            invalid_member_names='preserve',
+        ))
+
+        self.assertEqual(name.status, 'preserved')
+        self.assertEqual(name.text, 'café.txt')
+        self.assertEqual(name.used_name_bytes, raw_name)
+        self.assertEqual(name.reasons, ('unicode-path-name-crc-mismatch',))
 
     def test_methods_and_chunk_sizes(self):
         rnd = random.Random()
