@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import io
 import platform
+import struct
 import unittest
 import uuid
 import random
@@ -16,6 +17,9 @@ from stream_unzip import (
     UnsupportedCompressionTypeError,
     UnsupportedZip64Error,
     UnexpectedSignatureError,
+    ArchiveVerificationError,
+    IncompleteArchiveError,
+    CentralDirectoryMismatchError,
     HMACIntegrityError,
     CRC32IntegrityError,
     MissingZipCryptoPasswordError,
@@ -24,6 +28,25 @@ from stream_unzip import (
     IncorrectAESPasswordError,
     DeflateError,
 )
+
+
+def zip_bytes(entries, method=zipfile.ZIP_DEFLATED, force_zip64=False):
+    file = io.BytesIO()
+    with zipfile.ZipFile(file, 'w', method) as zf:
+        for name, content in entries:
+            if force_zip64:
+                with zf.open(zipfile.ZipInfo(name), 'w', force_zip64=True) as f:
+                    f.write(content)
+            else:
+                zf.writestr(name, content)
+    return file.getvalue()
+
+
+def consume_all(unzipped):
+    return [
+        (name, size, b''.join(chunks))
+        for name, size, chunks in unzipped
+    ]
 
 
 class TestStreamUnzip(unittest.TestCase):
@@ -852,3 +875,183 @@ class TestStreamUnzip(unittest.TestCase):
         self.assertEqual(var.get(), 'set-from-outer')
         self.assertEqual(inner, 'set-from-outer')
         self.assertEqual(d.get()['key'], 'set-from-inner')
+
+    def test_verify_central_directory(self):
+        rnd = random.Random()
+        rnd.seed(1)
+
+        methods = [zipfile.ZIP_BZIP2, zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED]
+        input_sizes = [1, 7, 65536]
+
+        contents = [
+            b'short',
+            b''.join([uuid.UUID(int=rnd.getrandbits(128), version=4).hex.encode() for _ in range(0, 1000)]),
+        ]
+
+        for content, method, input_size in itertools.product(contents, methods, input_sizes):
+            with self.subTest(content=content[:5], method=method, input_size=input_size):
+                data = zip_bytes([('first.txt', content), ('second.txt', content)], method=method)
+                chunks = (data[i:i + input_size] for i in range(0, len(data), input_size))
+                files = consume_all(stream_unzip(chunks, verify_central_directory=True))
+                self.assertEqual(files, [
+                    (b'first.txt', len(content), content),
+                    (b'second.txt', len(content), content),
+                ])
+
+    def test_verify_central_directory_tampered_crc_32(self):
+        # The local headers and file data are completely valid, so each member's own
+        # CRC32 check passes - but the central directory disagrees, so the archive as
+        # a whole must be rejected once its tail is read
+        data = zip_bytes([('first.txt', b'hello' * 1000), ('second.txt', b'world' * 1000)])
+        cd_offset = data.find(b'PK\x01\x02')
+        tampered = data[:cd_offset + 16] + b'\xde\xad\xbe\xef' + data[cd_offset + 20:]
+
+        # Without verification, the tampering goes unnoticed
+        self.assertEqual(len(consume_all(stream_unzip([tampered]))), 2)
+
+        with self.assertRaises(CentralDirectoryMismatchError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_tampered_name(self):
+        data = zip_bytes([('first.txt', b'hello'), ('second.txt', b'world')])
+        cd_offset = data.find(b'PK\x01\x02')
+        name_offset = cd_offset + 46
+        tampered = data[:name_offset] + b'xirst.txt' + data[name_offset + 9:]
+
+        with self.assertRaises(CentralDirectoryMismatchError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_tampered_flags(self):
+        data = zip_bytes([('first.txt', b'hello')])
+        cd_offset = data.find(b'PK\x01\x02')
+        tampered = data[:cd_offset + 8] + b'\x08\x00' + data[cd_offset + 10:]
+
+        with self.assertRaises(CentralDirectoryMismatchError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_tampered_local_header_offset(self):
+        data = zip_bytes([('first.txt', b'hello'), ('second.txt', b'world')])
+        second_cd_offset = data.find(b'PK\x01\x02', data.find(b'PK\x01\x02') + 1)
+        tampered = data[:second_cd_offset + 42] + b'\x01\x00\x00\x00' + data[second_cd_offset + 46:]
+
+        with self.assertRaises(CentralDirectoryMismatchError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_missing_end_record(self):
+        data = zip_bytes([('first.txt', b'hello')])
+
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([data[:-22]], verify_central_directory=True))
+
+    def test_verify_central_directory_truncated_central_directory(self):
+        data = zip_bytes([('first.txt', b'hello'), ('second.txt', b'world')])
+        cd_offset = data.find(b'PK\x01\x02')
+
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([data[:cd_offset + 10]], verify_central_directory=True))
+
+    def test_verify_central_directory_missing_central_directory(self):
+        data = zip_bytes([('first.txt', b'hello'), ('second.txt', b'world')])
+        cd_offset = data.find(b'PK\x01\x02')
+        eocd_offset = data.rfind(b'PK\x05\x06')
+
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([data[:cd_offset] + data[eocd_offset:]], verify_central_directory=True))
+
+    def test_verify_central_directory_entry_count_mismatch(self):
+        data = zip_bytes([('first.txt', b'hello')])
+        eocd_offset = data.rfind(b'PK\x05\x06')
+        tampered = data[:eocd_offset + 10] + b'\x02\x00' + data[eocd_offset + 12:]
+
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_duplicate_names(self):
+        # Members with duplicate names are matched to central directory entries by
+        # their physical position in the archive, not by name
+        data = zip_bytes([('dup.txt', b'aaa'), ('dup.txt', b'bbb')])
+        self.assertEqual(consume_all(stream_unzip([data], verify_central_directory=True)), [
+            (b'dup.txt', 3, b'aaa'),
+            (b'dup.txt', 3, b'bbb'),
+        ])
+
+        # Tamper with the CRC32 of the second central directory entry only
+        second_cd_offset = data.find(b'PK\x01\x02', data.find(b'PK\x01\x02') + 1)
+        tampered = data[:second_cd_offset + 16] + b'\xde\xad\xbe\xef' + data[second_cd_offset + 20:]
+        with self.assertRaises(CentralDirectoryMismatchError):
+            consume_all(stream_unzip([tampered], verify_central_directory=True))
+
+    def test_verify_central_directory_zip64(self):
+        content = b'zip64 content'
+        data = zip_bytes([('z64.txt', content)], force_zip64=True)
+        self.assertEqual(
+            consume_all(stream_unzip([data], verify_central_directory=True)),
+            [(b'z64.txt', len(content), content)],
+        )
+
+    def test_verify_central_directory_zip64_end_record(self):
+        data = zip_bytes([('first.txt', b'hello'), ('second.txt', b'world')])
+        eocd_offset = data.rfind(b'PK\x05\x06')
+        _, _, num_entries, _, cd_size, cd_offset, _ = struct.unpack('<4H2IH', data[eocd_offset + 4:eocd_offset + 22])
+
+        zip64_eocd = b'PK\x06\x06' + struct.pack('<Q2H2I4Q', 44, 45, 45, 0, 0, num_entries, num_entries, cd_size, cd_offset)
+        locator = b'PK\x06\x07' + struct.pack('<IQI', 0, eocd_offset, 1)
+        saturated_eocd = b'PK\x05\x06' + struct.pack('<4H2IH', 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+
+        data_zip64 = data[:eocd_offset] + zip64_eocd + locator + saturated_eocd
+        self.assertEqual(
+            [name for name, _, _ in consume_all(stream_unzip([data_zip64], verify_central_directory=True))],
+            [b'first.txt', b'second.txt'],
+        )
+
+        # A saturated end of central directory record without its ZIP64 record is incomplete
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([data[:eocd_offset] + saturated_eocd], verify_central_directory=True))
+
+        # A ZIP64 end of central directory record that disagrees on the entry count
+        bad_zip64_eocd = b'PK\x06\x06' + struct.pack('<Q2H2I4Q', 44, 45, 45, 0, 0, num_entries + 1, num_entries + 1, cd_size, cd_offset)
+        with self.assertRaises(IncompleteArchiveError):
+            consume_all(stream_unzip([data[:eocd_offset] + bad_zip64_eocd + locator + saturated_eocd], verify_central_directory=True))
+
+    def test_verify_central_directory_empty_zip(self):
+        data = zip_bytes([])
+        self.assertEqual(consume_all(stream_unzip([data], verify_central_directory=True)), [])
+
+    def test_verify_central_directory_trailing_data(self):
+        data = zip_bytes([('first.txt', b'hello')])
+        with self.assertRaises(ArchiveVerificationError):
+            consume_all(stream_unzip([data + b'junk'], verify_central_directory=True))
+
+    def test_verify_central_directory_fixtures(self):
+        # Real-world archives using data descriptors, encryption and deflate64
+        for path, password in [
+            ('fixtures/macos_10_14_5_single_file.zip', None),
+            ('fixtures/macos_10_14_5_multiple_files.zip', None),
+            ('fixtures/7za_17_4_aes.zip', b'password'),
+            ('fixtures/7za_17_4_aes_data_descriptor.zip', b'password'),
+            ('fixtures/infozip_3_0_password.zip', b'password'),
+            ('fixtures/7z_17_4_password_data_descriptor.zip', b'password'),
+            ('fixtures/7za_17_4_deflate64.zip', None),
+        ]:
+            with self.subTest(path=path):
+                with open(path, 'rb') as f:
+                    data = f.read()
+                for name, size, chunks in stream_unzip([data], password=password, verify_central_directory=True):
+                    for _ in chunks:
+                        pass
+
+    def test_verify_central_directory_async(self):
+        data = zip_bytes([('first.txt', b'hello' * 1000)])
+        cd_offset = data.find(b'PK\x01\x02')
+        tampered = data[:cd_offset + 16] + b'\xde\xad\xbe\xef' + data[cd_offset + 20:]
+
+        async def async_bytes():
+            yield tampered
+
+        async def test():
+            async for name, size, chunks in async_stream_unzip(async_bytes(), verify_central_directory=True):
+                async for _ in chunks:
+                    pass
+
+        with self.assertRaises(CentralDirectoryMismatchError):
+            asyncio.get_event_loop().run_until_complete(test())

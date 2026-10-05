@@ -104,6 +104,18 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
 
                 Each section of a ZIP file starts with a _signature_, and an unexpected one was encountered.
 
+            - **ArchiveVerificationError**
+
+                Verification of the central directory against the streamed members failed. Only raised when `verify_central_directory=True`.
+
+                - **IncompleteArchiveError**
+
+                    The central directory, the end of central directory record, or their ZIP64 equivalents are missing, truncated, or inconsistent with each other.
+
+                - **CentralDirectoryMismatchError**
+
+                    A central directory entry disagrees with the member actually streamed at that position in the archive.
+
             - **MissingExtraError**
 
                 Metadata known as *extra* that some ZIP files require is missing.

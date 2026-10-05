@@ -12,14 +12,21 @@ from Crypto.Protocol.KDF import PBKDF2
 from stream_inflate import stream_inflate64
 
 
-def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
+def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True, verify_central_directory=False):
     local_file_header_signature = b'PK\x03\x04'
     local_file_header_struct = Struct('<H2sHHHIIIHH')
     zip64_compressed_size = 0xFFFFFFFF
+    zip64_saturated_count = 0xFFFF
     zip64_size_signature = b'\x01\x00'
     aes_extra_signature = b'\x01\x99'
     central_directory_signature = b'PK\x01\x02'
+    central_directory_header_struct = Struct('<6H3I5H2I')
     end_of_central_directory_signature = b'PK\x05\x06'
+    end_of_central_directory_struct = Struct('<4H2IH')
+    zip64_end_of_central_directory_signature = b'PK\x06\x06'
+    zip64_end_of_central_directory_struct = Struct('<Q2H2I4Q')
+    zip64_end_of_central_directory_locator_signature = b'PK\x06\x07'
+    zip64_end_of_central_directory_locator_struct = Struct('<IQI')
     unsigned_short = Struct('<H')
     unsigned_long_long = Struct('<Q')
 
@@ -28,6 +35,22 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
     dd_struct_32_with_sig = Struct('<4sIII4s')
     dd_struct_64 = Struct('<0sIQQ4s')
     dd_struct_64_with_sig = Struct('<4sIQQ4s')
+
+    def get_flag_bits(flags):
+        for b in flags:
+            for i in range(8):
+                yield (b >> i) & 1
+
+    def parse_extra(extra):
+        extra_offset = 0
+        while extra_offset <= len(extra) - 4:
+            extra_signature = extra[extra_offset:extra_offset+2]
+            extra_offset += 2
+            extra_data_size, = unsigned_short.unpack(extra[extra_offset:extra_offset+2])
+            extra_offset += 2
+            extra_data = extra[extra_offset:extra_offset+extra_data_size]
+            extra_offset += extra_data_size
+            yield (extra_signature, extra_data)
 
     def next_or_truncated_error(it):
         try:
@@ -175,23 +198,7 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
 
         return _decompress, _is_done, _num_unused
 
-    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start):
-
-        def get_flag_bits(flags):
-            for b in flags:
-                for i in range(8):
-                    yield (b >> i) & 1
-
-        def parse_extra(extra):
-            extra_offset = 0
-            while extra_offset <= len(extra) - 4:
-                extra_signature = extra[extra_offset:extra_offset+2]
-                extra_offset += 2
-                extra_data_size, = unsigned_short.unpack(extra[extra_offset:extra_offset+2])
-                extra_offset += 2
-                extra_data = extra[extra_offset:extra_offset+extra_data_size]
-                extra_offset += extra_data_size
-                yield (extra_signature, extra_data)
+    def yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, member_records, header_offset):
 
         def get_extra_value(extra, if_true, signature, exception_if_missing, min_length, exception_if_too_short):
             value = None
@@ -441,19 +448,172 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
         checked_bytes = \
             checked_from_data_descriptor(counted_decompressed_bytes, is_sure_zip64, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size) if has_data_descriptor else \
             checked_from_local_header(counted_decompressed_bytes, is_aes_2_encrypted, get_crc_32_actual, get_compressed_size, get_uncompressed_size)
-            
+
+        if member_records is not None:
+            # Record just enough to later verify the central directory against what was
+            # actually streamed. Until the central directory is verified, the results of
+            # this member are only provisionally valid
+            member_record = {
+                'name': file_name,
+                'flags': unsigned_short.unpack(flags)[0],
+                'compression': compression_raw,
+                'is_aes_2': is_aes_2_encrypted,
+                'header_offset': header_offset,
+                'crc_32': None,
+                'compressed_size': None,
+                'uncompressed_size': None,
+            }
+            member_records.append(member_record)
+
+            def record_actuals(chunks):
+                yield from chunks
+                member_record['crc_32'] = get_crc_32_actual()
+                member_record['compressed_size'] = get_compressed_size()
+                member_record['uncompressed_size'] = get_uncompressed_size()
+
+            checked_bytes = record_actuals(checked_bytes)
+
         return file_name, uncompressed_size, checked_bytes
+
+    def verify_tail(first_signature, first_signature_offset, member_records, get_num, yield_all, get_offset_from_start):
+        # Verify the central directory and end of central directory record against the
+        # members actually streamed. Members are matched to central directory entries by
+        # their physical position in the archive, so members with duplicate names are
+        # each verified against their own entry
+        cd_records = []
+        signature = first_signature
+        cd_offset = first_signature_offset if signature == central_directory_signature else None
+
+        try:
+            while signature == central_directory_signature:
+                (
+                    version_made_by, version_needed, flags, compression, mod_time, mod_date,
+                    crc_32, compressed_size_raw, uncompressed_size_raw,
+                    file_name_len, extra_field_len, comment_len,
+                    disk_number_start, internal_attrs, external_attrs, local_header_offset_raw,
+                ) = central_directory_header_struct.unpack(get_num(central_directory_header_struct.size))
+                file_name = get_num(file_name_len)
+                zip64_extra = dict(parse_extra(get_num(extra_field_len))).get(zip64_size_signature)
+                get_num(comment_len)
+                cd_records.append((file_name, flags, compression, crc_32, compressed_size_raw, uncompressed_size_raw, local_header_offset_raw, zip64_extra))
+                signature = get_num(len(central_directory_signature))
+
+            cd_end_offset = get_offset_from_start() - len(central_directory_signature)
+
+            zip64_eocd = None
+            if signature == zip64_end_of_central_directory_signature:
+                zip64_eocd = zip64_end_of_central_directory_struct.unpack(get_num(zip64_end_of_central_directory_struct.size))
+                if get_num(len(zip64_end_of_central_directory_locator_signature)) != zip64_end_of_central_directory_locator_signature:
+                    raise IncompleteArchiveError('Missing ZIP64 end of central directory locator')
+                zip64_end_of_central_directory_locator_struct.unpack(get_num(zip64_end_of_central_directory_locator_struct.size))
+                signature = get_num(len(end_of_central_directory_signature))
+
+            if signature != end_of_central_directory_signature:
+                raise IncompleteArchiveError('Missing end of central directory record')
+
+            (
+                disk_number, cd_disk_number, num_entries_disk_32, num_entries_total_32,
+                cd_size_32, cd_offset_32, comment_len,
+            ) = end_of_central_directory_struct.unpack(get_num(end_of_central_directory_struct.size))
+            get_num(comment_len)
+        except TruncatedDataError:
+            raise IncompleteArchiveError('Stream ended before the end of central directory record') from None
+
+        def eocd_value(value_32, saturated, zip64_index):
+            if value_32 != saturated:
+                return value_32
+            if zip64_eocd is None:
+                raise IncompleteArchiveError('Missing ZIP64 end of central directory record')
+            return zip64_eocd[zip64_index]
+
+        num_entries_disk = eocd_value(num_entries_disk_32, zip64_saturated_count, 5)
+        num_entries_total = eocd_value(num_entries_total_32, zip64_saturated_count, 6)
+        cd_size = eocd_value(cd_size_32, zip64_compressed_size, 7)
+        cd_offset_declared = eocd_value(cd_offset_32, zip64_compressed_size, 8)
+
+        if num_entries_disk != num_entries_total or len(cd_records) != num_entries_total:
+            raise IncompleteArchiveError('Central directory does not match the end of central directory record')
+
+        if len(cd_records) != len(member_records):
+            raise IncompleteArchiveError('Central directory does not contain all the members in the stream')
+
+        if cd_records:
+            if cd_offset_declared != cd_offset or cd_size != cd_end_offset - cd_offset:
+                raise CentralDirectoryMismatchError('Central directory location does not match the end of central directory record')
+        elif cd_size != 0:
+            raise CentralDirectoryMismatchError('End of central directory record declares a non-empty central directory')
+
+        for index, (member, cd_record) in enumerate(zip(member_records, cd_records)):
+            (
+                file_name, flags, compression, crc_32,
+                compressed_size_raw, uncompressed_size_raw, local_header_offset_raw, zip64_extra,
+            ) = cd_record
+
+            def mismatch(field):
+                raise CentralDirectoryMismatchError(f'Central directory {field} does not match member {index} ({member["name"]!r})')
+
+            if zip64_extra is None and zip64_compressed_size in (compressed_size_raw, uncompressed_size_raw, local_header_offset_raw):
+                raise CentralDirectoryMismatchError(f'Central directory entry for member {index} ({member["name"]!r}) is missing its ZIP64 extra field')
+
+            zip64_extra = zip64_extra or b''
+            zip64_extra_offset = 0
+            uncompressed_size = uncompressed_size_raw
+            compressed_size = compressed_size_raw
+            local_header_offset = local_header_offset_raw
+
+            def zip64_value():
+                nonlocal zip64_extra_offset
+                if len(zip64_extra) < zip64_extra_offset + 8:
+                    raise TruncatedZip64ExtraError()
+                value, = unsigned_long_long.unpack(zip64_extra[zip64_extra_offset:zip64_extra_offset + 8])
+                zip64_extra_offset += 8
+                return value
+
+            if uncompressed_size_raw == zip64_compressed_size:
+                uncompressed_size = zip64_value()
+            if compressed_size_raw == zip64_compressed_size:
+                compressed_size = zip64_value()
+            if local_header_offset_raw == zip64_compressed_size:
+                local_header_offset = zip64_value()
+
+            if file_name != member['name']:
+                mismatch('file name')
+            if flags != member['flags']:
+                mismatch('flags')
+            if compression != member['compression']:
+                mismatch('compression method')
+            if not member['is_aes_2'] and crc_32 != member['crc_32']:
+                mismatch('CRC32')
+            if compressed_size != member['compressed_size']:
+                mismatch('compressed size')
+            if uncompressed_size != member['uncompressed_size']:
+                mismatch('uncompressed size')
+            if local_header_offset != member['header_offset']:
+                mismatch('local header offset')
+
+        for _ in yield_all():
+            raise ArchiveVerificationError('Data found after the end of central directory record')
 
     def all():
         yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start = get_byte_readers(zipfile_chunks)
+        member_records = [] if verify_central_directory else None
 
         while True:
-            signature = get_num(len(local_file_header_signature))
+            try:
+                signature = get_num(len(local_file_header_signature))
+            except TruncatedDataError:
+                if verify_central_directory:
+                    raise IncompleteArchiveError('Stream ended before the central directory and end of central directory record') from None
+                raise
+            section_offset = get_offset_from_start() - len(local_file_header_signature)
             if signature == local_file_header_signature:
-                yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start)
+                yield yield_file(yield_all, get_num, return_num_unused, return_bytes_unused, get_offset_from_start, member_records, section_offset)
             elif signature in (central_directory_signature, end_of_central_directory_signature):
-                for _ in yield_all():
-                    pass
+                if verify_central_directory:
+                    verify_tail(signature, section_offset, member_records, get_num, yield_all, get_offset_from_start)
+                else:
+                    for _ in yield_all():
+                        pass
                 break
             else:
                 raise UnexpectedSignatureError(signature)
@@ -547,6 +707,15 @@ class TruncatedDataError(DataError):
     pass
 
 class UnexpectedSignatureError(DataError):
+    pass
+
+class ArchiveVerificationError(DataError):
+    pass
+
+class IncompleteArchiveError(ArchiveVerificationError):
+    pass
+
+class CentralDirectoryMismatchError(ArchiveVerificationError):
     pass
 
 class MissingExtraError(DataError):

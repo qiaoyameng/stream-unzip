@@ -43,3 +43,16 @@ for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), passw
 ```
 
 The file name and file size are extracted as reported from the file. If you don't trust the creator of the ZIP file, these should be treated as untrusted input.
+
+
+## Verifying the central directory
+
+By default, only the local headers and the file data itself are checked as they stream past. The central directory at the end of the ZIP is not consulted, so a member whose own CRC32 is correct could still come from an archive whose central directory has been tampered with. Pass `verify_central_directory=True` to also parse the central directory, the end of central directory record, and any ZIP64 equivalents, and check them against the members actually streamed - names, methods, flags, CRC32s, sizes, offsets, and ZIP64 extras are all compared, with members matched to central directory entries by their physical position in the archive.
+
+```python
+for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), verify_central_directory=True):
+    for chunk in unzipped_chunks:
+        print(chunk)
+```
+
+With verification enabled, each yielded member is only provisionally valid: the archive as a whole is confirmed only once the outer iterator is exhausted without raising. A missing central directory or end of central directory record raises `IncompleteArchiveError`, and any disagreement between the central directory and the streamed members raises `CentralDirectoryMismatchError` - even if every member's own checks passed.
