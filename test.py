@@ -1,15 +1,21 @@
 import asyncio
 import itertools
 import io
+import os
 import platform
+import struct
+import tempfile
 import unittest
 import uuid
 import random
 import zipfile
 
+import stream_unzip as stream_unzip_module
 from stream_unzip import (
     async_stream_unzip,
+    async_stream_unzip_verified,
     stream_unzip,
+    stream_unzip_verified,
     UnfinishedIterationError,
     TruncatedDataError,
     UnsupportedFlagsError,
@@ -18,12 +24,71 @@ from stream_unzip import (
     UnexpectedSignatureError,
     HMACIntegrityError,
     CRC32IntegrityError,
+    UncompressedSizeLimitError,
     MissingZipCryptoPasswordError,
     MissingAESPasswordError,
     IncorrectZipCryptoPasswordError,
     IncorrectAESPasswordError,
     DeflateError,
 )
+
+
+class TrackingSpooledTemporaryFile(tempfile.SpooledTemporaryFile):
+    rolled_names = []
+    closed_files = []
+
+    def rollover(self):
+        old_file = self._file
+        args = self._TemporaryFileArgs
+        new_file = tempfile.NamedTemporaryFile(
+            mode=args['mode'],
+            buffering=args['buffering'],
+            suffix=args['suffix'],
+            prefix=args['prefix'],
+            dir=args['dir'],
+        )
+        position = old_file.tell()
+        new_file.write(old_file.getvalue())
+        old_file.close()
+        new_file.seek(position)
+        self._file = new_file
+        self._rolled = True
+        del self._TemporaryFileArgs
+        self.rolled_names.append(self._file.name)
+
+    def close(self):
+        self.closed_files.append(self)
+        super().close()
+
+
+def zip_bytes(*members, method=zipfile.ZIP_DEFLATED):
+    file = io.BytesIO()
+    with zipfile.ZipFile(file, 'w', method) as archive:
+        for name, content in members:
+            archive.writestr(name, content)
+    return file.getvalue()
+
+
+def bad_crc_data_descriptor_zip(content=b'hello world' * 20):
+    data = bytearray(zip_bytes(('bad.txt', content)))
+    name_length = struct.unpack_from('<H', data, 26)[0]
+    crc32, compressed_size, uncompressed_size = struct.unpack_from('<III', data, 14)
+    data_start = 30 + name_length
+    data[14:18] = b'\0' * 4
+    data[18:26] = b'\xff' * 8
+    descriptor = struct.pack('<4sIII', b'PK\x07\x08', crc32 ^ 1, compressed_size, uncompressed_size)
+    return bytes(data[:data_start + compressed_size]) + descriptor + bytes(data[data_start + compressed_size:])
+
+
+def bad_aes_hmac_zip():
+    with open('fixtures/7za_17_4_aes.zip', 'rb') as file:
+        data = bytearray(file.read())
+    name_length = struct.unpack_from('<H', data, 26)[0]
+    extra_length = struct.unpack_from('<H', data, 28)[0]
+    compressed_size = struct.unpack_from('<I', data, 18)[0]
+    authentication_code_start = 30 + name_length + extra_length + compressed_size - 10
+    data[authentication_code_start] ^= 1
+    return bytes(data)
 
 
 class TestStreamUnzip(unittest.TestCase):
@@ -852,3 +917,212 @@ class TestStreamUnzip(unittest.TestCase):
         self.assertEqual(var.get(), 'set-from-outer')
         self.assertEqual(inner, 'set-from-outer')
         self.assertEqual(d.get()['key'], 'set-from-inner')
+
+    def test_verified_small_member_stays_in_memory_and_can_be_read_in_chunks(self):
+        data = zip_bytes(('first.txt', b'first' * 10), ('second.txt', b'second' * 10))
+        files = []
+
+        for name, size, member_file in stream_unzip_verified([data], chunk_size=4):
+            self.assertIsNone(member_file.name)
+            chunks = []
+            while True:
+                chunk = member_file.read(7)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            member_file.close()
+            files.append((name, size, b''.join(chunks)))
+
+        self.assertEqual(files, [
+            (b'first.txt', 50, b'first' * 10),
+            (b'second.txt', 60, b'second' * 10),
+        ])
+
+    def test_verified_large_member_rolls_over_to_tmp_dir_and_caller_closes_handle(self):
+        content = b'large' * 100
+        data = zip_bytes(('large.txt', content))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            TrackingSpooledTemporaryFile.rolled_names = []
+            TrackingSpooledTemporaryFile.closed_files = []
+            original = stream_unzip_module._VerifiedTemporaryFile
+            stream_unzip_module._VerifiedTemporaryFile = TrackingSpooledTemporaryFile
+            try:
+                for name, size, member_file in stream_unzip_verified(
+                    [data],
+                    max_in_memory_size=100,
+                    tmp_dir=tmp_dir,
+                ):
+                    self.assertEqual((name, size), (b'large.txt', len(content)))
+                    temporary_name = member_file.name
+                    self.assertTrue(temporary_name.startswith(tmp_dir + os.sep))
+                    self.assertEqual(member_file.read(5), b'large')
+                    self.assertTrue(os.path.exists(temporary_name))
+                    member_file.close()
+                    self.assertFalse(os.path.exists(temporary_name))
+
+                    break
+            finally:
+                stream_unzip_module._VerifiedTemporaryFile = original
+
+        self.assertEqual(TrackingSpooledTemporaryFile.rolled_names, [temporary_name])
+        self.assertEqual(len(TrackingSpooledTemporaryFile.closed_files), 1)
+
+    def test_verified_bad_tail_crc_does_not_deliver_member_or_plaintext(self):
+        TrackingSpooledTemporaryFile.rolled_names = []
+        TrackingSpooledTemporaryFile.closed_files = []
+        original = stream_unzip_module._VerifiedTemporaryFile
+        stream_unzip_module._VerifiedTemporaryFile = TrackingSpooledTemporaryFile
+        delivered = []
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                with self.assertRaises(CRC32IntegrityError):
+                    for name, size, member_file in stream_unzip_verified(
+                        [bad_crc_data_descriptor_zip()],
+                        max_in_memory_size=10,
+                        tmp_dir=tmp_dir,
+                    ):
+                        delivered.append((name, size, member_file.read()))
+                        member_file.close()
+        finally:
+            stream_unzip_module._VerifiedTemporaryFile = original
+
+        self.assertEqual(delivered, [])
+        self.assertEqual(len(TrackingSpooledTemporaryFile.rolled_names), 1)
+        self.assertEqual(len(TrackingSpooledTemporaryFile.closed_files), 1)
+
+    def test_verified_bad_tail_aes_hmac_does_not_deliver_member_or_plaintext(self):
+        TrackingSpooledTemporaryFile.rolled_names = []
+        TrackingSpooledTemporaryFile.closed_files = []
+        original = stream_unzip_module._VerifiedTemporaryFile
+        stream_unzip_module._VerifiedTemporaryFile = TrackingSpooledTemporaryFile
+        delivered = []
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                with self.assertRaises(HMACIntegrityError):
+                    for name, size, member_file in stream_unzip_verified(
+                        [bad_aes_hmac_zip()],
+                        password=b'password',
+                        max_in_memory_size=10,
+                        tmp_dir=tmp_dir,
+                    ):
+                        delivered.append((name, size, member_file.read()))
+                        member_file.close()
+        finally:
+            stream_unzip_module._VerifiedTemporaryFile = original
+
+        self.assertEqual(delivered, [])
+        self.assertEqual(len(TrackingSpooledTemporaryFile.rolled_names), 1)
+        self.assertEqual(len(TrackingSpooledTemporaryFile.closed_files), 1)
+
+    def test_verified_enforces_uncompressed_size_before_delivery(self):
+        data = zip_bytes(('large.txt', b'x' * 11))
+        delivered = []
+
+        with self.assertRaises(UncompressedSizeLimitError):
+            for name, size, member_file in stream_unzip_verified(
+                [data],
+                max_uncompressed_size=10,
+            ):
+                delivered.append((name, size, member_file.read()))
+                member_file.close()
+
+        self.assertEqual(delivered, [])
+
+    def test_verified_requires_tmp_dir_when_in_memory_limit_is_set(self):
+        with self.assertRaisesRegex(ValueError, 'tmp_dir is required'):
+            next(iter(stream_unzip_verified([], max_in_memory_size=1)))
+
+    def test_verified_early_stop_closes_undelivered_member_iteration(self):
+        data = zip_bytes(
+            ('first.txt', b'first'),
+            ('second.txt', b'x' * 1000),
+        )
+        consumed = []
+
+        def chunks():
+            for index in range(0, len(data), 16):
+                chunk = data[index:index + 16]
+                consumed.append(chunk)
+                yield chunk
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            members = stream_unzip_verified(
+                chunks(),
+                max_in_memory_size=10,
+                tmp_dir=tmp_dir,
+            )
+            name, size, member_file = next(members)
+            self.assertEqual((name, size), (b'first.txt', 5))
+            member_file.close()
+            members.close()
+
+            self.assertLess(sum(map(len, consumed)), len(data))
+            self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_async_verified_members_can_be_read_in_chunks(self):
+        data = zip_bytes(('first.txt', b'first' * 10))
+        results = []
+
+        async def async_bytes():
+            yield data
+
+        async def test():
+            async for name, size, member_file in async_stream_unzip_verified(async_bytes(), chunk_size=4):
+                chunks = []
+                while True:
+                    chunk = member_file.read(7)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                member_file.close()
+                results.append((name, size, b''.join(chunks)))
+
+        asyncio.get_event_loop().run_until_complete(test())
+        self.assertEqual(results, [(b'first.txt', 50, b'first' * 10)])
+
+    def test_async_verified_bad_tail_aes_hmac_does_not_deliver_member(self):
+        delivered = []
+
+        async def chunks():
+            yield bad_aes_hmac_zip()
+
+        async def test():
+            async for name, size, member_file in async_stream_unzip_verified(
+                chunks(),
+                password=b'password',
+            ):
+                delivered.append((name, size, member_file.read()))
+                member_file.close()
+
+        with self.assertRaises(HMACIntegrityError):
+            asyncio.get_event_loop().run_until_complete(test())
+        self.assertEqual(delivered, [])
+
+    def test_async_verified_cancellation_cleans_undelivered_temp_file(self):
+        content = b'x' * 100
+        data = zip_bytes(('large.txt', content), method=zipfile.ZIP_STORED)
+        name_length = len('large.txt')
+        first_part = data[:30 + name_length + 20]
+
+        async def chunks():
+            yield first_part
+            await asyncio.Event().wait()
+
+        async def test():
+            members = async_stream_unzip_verified(
+                chunks(),
+                max_in_memory_size=10,
+                tmp_dir=tmp_dir,
+            )
+            task = asyncio.ensure_future(members.__anext__())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            asyncio.get_event_loop().run_until_complete(test())
+            self.assertEqual(os.listdir(tmp_dir), [])

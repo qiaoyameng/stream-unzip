@@ -2,6 +2,9 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import queue
+import tempfile
+import threading
 import zlib
 
 from Crypto.Cipher import AES
@@ -10,6 +13,30 @@ from Crypto.Util import Counter
 from Crypto.Protocol.KDF import PBKDF2
 
 from stream_inflate import stream_inflate64
+
+
+class _VerifiedTemporaryFile(tempfile.SpooledTemporaryFile):
+
+    def rollover(self):
+        if self._rolled:
+            return
+
+        old_file = self._file
+        args = self._TemporaryFileArgs
+        new_file = tempfile.NamedTemporaryFile(
+            mode=args['mode'],
+            buffering=args['buffering'],
+            suffix=args['suffix'],
+            prefix=args['prefix'],
+            dir=args['dir'],
+        )
+        position = old_file.tell()
+        new_file.write(old_file.getvalue())
+        old_file.close()
+        new_file.seek(position)
+        self._file = new_file
+        self._rolled = True
+        del self._TemporaryFileArgs
 
 
 def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=True):
@@ -464,6 +491,220 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnfinishedIterationError()
 
 
+def stream_unzip_verified(
+    zipfile_chunks,
+    password=None,
+    chunk_size=65536,
+    allow_zip64=True,
+    max_uncompressed_size=None,
+    max_in_memory_size=None,
+    tmp_dir=None,
+):
+    if max_uncompressed_size is not None and max_uncompressed_size < 0:
+        raise ValueError('max_uncompressed_size must be non-negative')
+    if max_in_memory_size is not None and max_in_memory_size < 0:
+        raise ValueError('max_in_memory_size must be non-negative')
+    if max_in_memory_size is not None and tmp_dir is None:
+        raise ValueError('tmp_dir is required when max_in_memory_size is set')
+
+    members = stream_unzip(
+        zipfile_chunks,
+        password=password,
+        chunk_size=chunk_size,
+        allow_zip64=allow_zip64,
+    )
+
+    unzipped_file = None
+    unzipped_chunks = None
+
+    try:
+        for member in members:
+            file_name, file_size, unzipped_chunks = member
+            if (
+                file_size is not None
+                and max_uncompressed_size is not None
+                and file_size > max_uncompressed_size
+            ):
+                raise UncompressedSizeLimitError(max_uncompressed_size)
+
+            unzipped_file = _VerifiedTemporaryFile(
+                max_size=0 if max_in_memory_size is not None else None,
+                dir=tmp_dir,
+            )
+            uncompressed_size = 0
+
+            for chunk in unzipped_chunks:
+                next_uncompressed_size = uncompressed_size + len(chunk)
+                if max_uncompressed_size is not None and next_uncompressed_size > max_uncompressed_size:
+                    raise UncompressedSizeLimitError(max_uncompressed_size)
+
+                if (
+                    max_in_memory_size is not None
+                    and next_uncompressed_size > max_in_memory_size
+                ):
+                    unzipped_file.rollover()
+
+                unzipped_file.write(chunk)
+                uncompressed_size = next_uncompressed_size
+
+            unzipped_file.seek(0)
+            verified_file = unzipped_file
+            unzipped_file = None
+            unzipped_chunks = None
+            yield file_name, file_size, verified_file
+    except:
+        if unzipped_file is not None:
+            unzipped_file.close()
+        if unzipped_chunks is not None:
+            unzipped_chunks.close()
+        raise
+    finally:
+        members.close()
+
+
+async def async_stream_unzip_verified(
+    chunks,
+    password=None,
+    chunk_size=65536,
+    allow_zip64=True,
+    max_uncompressed_size=None,
+    max_in_memory_size=None,
+    tmp_dir=None,
+):
+    if max_uncompressed_size is not None and max_uncompressed_size < 0:
+        raise ValueError('max_uncompressed_size must be non-negative')
+    if max_in_memory_size is not None and max_in_memory_size < 0:
+        raise ValueError('max_in_memory_size must be non-negative')
+    if max_in_memory_size is not None and tmp_dir is None:
+        raise ValueError('tmp_dir is required when max_in_memory_size is set')
+
+    input_queue = queue.Queue(maxsize=1)
+    output_queue = queue.Queue(maxsize=1)
+    try:
+        loop = asyncio.get_event_loop()
+    except:
+        loop = asyncio.get_event_loop()
+    done = object()
+    closing = threading.Event()
+
+    def sync_chunks():
+        while True:
+            try:
+                chunk = input_queue.get(timeout=0.01)
+            except queue.Empty:
+                if closing.is_set():
+                    return
+                continue
+            if chunk is done:
+                return
+            if isinstance(chunk, BaseException):
+                raise chunk
+            yield chunk
+
+    def put_output(item):
+        while not closing.is_set():
+            try:
+                output_queue.put(item, timeout=0.01)
+                return
+            except queue.Full:
+                pass
+
+    def verify_in_thread():
+        verified_members = iter(stream_unzip_verified(
+            sync_chunks(),
+            password=password,
+            chunk_size=chunk_size,
+            allow_zip64=allow_zip64,
+            max_uncompressed_size=max_uncompressed_size,
+            max_in_memory_size=max_in_memory_size,
+            tmp_dir=tmp_dir,
+        ))
+
+        try:
+            while not closing.is_set():
+                member = next(verified_members)
+                delivered = threading.Event()
+                released = threading.Event()
+                put_output((member, delivered, released))
+                while not delivered.is_set() and not closing.is_set():
+                    delivered.wait(0.01)
+                if closing.is_set():
+                    if not delivered.is_set():
+                        member[2].close()
+                    verified_members.close()
+                    return
+                while not released.is_set() and not closing.is_set():
+                    released.wait(0.01)
+                if closing.is_set():
+                    verified_members.close()
+                    return
+        except StopIteration:
+            pass
+        except BaseException as exception:
+            if not closing.is_set():
+                put_output(exception)
+            return
+
+        if not closing.is_set():
+            put_output(done)
+
+    async def produce_input():
+        def put_input(item):
+            while not closing.is_set():
+                try:
+                    input_queue.put(item, timeout=0.01)
+                    return True
+                except queue.Full:
+                    return False
+            return False
+
+        try:
+            async for chunk in chunks:
+                while not put_input(chunk):
+                    await asyncio.sleep(0)
+                if closing.is_set():
+                    break
+            else:
+                while not put_input(done):
+                    await asyncio.sleep(0)
+        except BaseException as exception:
+            if closing.is_set():
+                raise
+            while not put_input(exception):
+                await asyncio.sleep(0)
+
+    producer = asyncio.ensure_future(produce_input(), loop=loop)
+    verifier = threading.Thread(target=verify_in_thread)
+    verifier.start()
+
+    try:
+        while True:
+            try:
+                item = output_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
+                continue
+            if item is done:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            member, delivered, released = item
+            delivered.set()
+            try:
+                yield member
+            finally:
+                released.set()
+    finally:
+        closing.set()
+        producer.cancel()
+        try:
+            await producer
+        except:
+            pass
+        while verifier.is_alive():
+            await asyncio.sleep(0.01)
+
+
 async def async_stream_unzip(chunks, *args, **kwargs):
 
     async def to_async_iterable(sync_iterable):
@@ -544,6 +785,9 @@ class UnsupportedZip64Error(UnsupportedFeatureError):
     pass
 
 class TruncatedDataError(DataError):
+    pass
+
+class UncompressedSizeLimitError(DataError):
     pass
 
 class UnexpectedSignatureError(DataError):

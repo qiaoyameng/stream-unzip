@@ -100,6 +100,10 @@ Exceptions raised by the source iterable are passed through `stream_unzip` uncha
 
                 The stream of bytes ended unexpectedly.
 
+            - **UncompressedSizeLimitError**
+
+                A member decompressed to more bytes than allowed by `max_uncompressed_size`.
+
             - **UnexpectedSignatureError**
 
                 Each section of a ZIP file starts with a _signature_, and an unexpected one was encountered.

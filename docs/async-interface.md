@@ -33,6 +33,26 @@ async def main():
 asyncio.run(main())
 ```
 
+For members that must not be exposed until their trailing CRC or AES HMAC has been verified, use `async_stream_unzip_verified` with the same `max_uncompressed_size`, `max_in_memory_size`, and `tmp_dir` arguments as the synchronous interface. It yields a binary file object after verification, and the caller is responsible for closing it:
+
+```python
+async for file_name, file_size, member_file in async_stream_unzip_verified(
+        zipped_chunks(client),
+        password=b'my-password',
+        max_uncompressed_size=100 * 1024 * 1024,
+        max_in_memory_size=1024 * 1024,
+        tmp_dir=tmp_dir,
+):
+    try:
+        while True:
+            chunk = member_file.read(65536)
+            if not chunk:
+                break
+            print(chunk)
+    finally:
+        member_file.close()
+```
+
 > ### Warnings
 >
 > Under the hood `async_stream_unzip` uses threads as a layer over the synchronous `stream_unzip` function. This has two consequences:

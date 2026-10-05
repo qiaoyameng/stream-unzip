@@ -26,6 +26,8 @@ In addition to being memory efficient, stream-unzip supports:
 - ZIP files created by Java's ZipOutputStream that are larger than 4GiB. At the time of writing libarchive-based stream readers cannot read these without error.
 
 - BZip2-compressed ZIPs.
+
+- Verified-member extraction, where CRC or AES authentication completes before a member's readable file object is exposed.
 <!-- --8<-- [end:features] -->
 
 ---

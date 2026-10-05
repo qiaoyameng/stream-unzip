@@ -43,3 +43,33 @@ for file_name, file_size, unzipped_chunks in stream_unzip(zipped_chunks(), passw
 ```
 
 The file name and file size are extracted as reported from the file. If you don't trust the creator of the ZIP file, these should be treated as untrusted input.
+
+
+## Verified members
+
+The low-latency interface above yields a member's chunks before its trailing CRC or WinZip AES HMAC has been verified. If those chunks must not be made visible until the whole member has been authenticated, use `stream_unzip_verified` instead:
+
+```python
+import tempfile
+from stream_unzip import stream_unzip_verified
+
+with tempfile.TemporaryDirectory() as tmp_dir:
+    for file_name, file_size, member_file in stream_unzip_verified(
+        zipped_chunks(),
+        max_uncompressed_size=100 * 1024 * 1024,
+        max_in_memory_size=1024 * 1024,
+        tmp_dir=tmp_dir.name,
+    ):
+        try:
+            while True:
+                chunk = member_file.read(65536)
+                if not chunk:
+                    break
+                print(chunk)
+        finally:
+            member_file.close()
+```
+
+Members smaller than or equal to `max_in_memory_size` are held in memory. Larger members roll over to a named temporary file in `tmp_dir`. No member is yielded until its complete contents and trailing integrity checks have passed. Failed, cancelled, or abandoned members that have not been yielded are removed automatically.
+
+Once a file object has been yielded, the caller owns it and must close it. `max_uncompressed_size` limits the number of decompressed bytes accepted for a member. If `max_in_memory_size` is supplied, `tmp_dir` must also be supplied. Omitting `max_in_memory_size` keeps each member in memory, while omitting `max_uncompressed_size` does not impose a decompressed-size limit.
