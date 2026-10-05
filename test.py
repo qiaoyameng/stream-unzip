@@ -1,7 +1,9 @@
 import asyncio
 import itertools
 import io
+import os
 import platform
+import tempfile
 import unittest
 import uuid
 import random
@@ -9,8 +11,12 @@ import zipfile
 
 from stream_unzip import (
     async_stream_unzip,
+    async_stream_unzip_verified,
     stream_unzip,
+    stream_unzip_verified,
     UnfinishedIterationError,
+    UncompressedSizeLimitError,
+    UnzipValueError,
     TruncatedDataError,
     UnsupportedFlagsError,
     UnsupportedCompressionTypeError,
@@ -852,3 +858,295 @@ class TestStreamUnzip(unittest.TestCase):
         self.assertEqual(var.get(), 'set-from-outer')
         self.assertEqual(inner, 'set-from-outer')
         self.assertEqual(d.get()['key'], 'set-from-inner')
+
+
+def make_zip_bytes(members, method=zipfile.ZIP_DEFLATED):
+    file = io.BytesIO()
+    with zipfile.ZipFile(file, 'w', method) as zf:
+        for name, content in members:
+            zf.writestr(name, content)
+    return file.getvalue()
+
+
+def single_byte_chunks(data):
+    for i in range(0, len(data)):
+        yield data[i:i + 1]
+
+
+class TestStreamUnzipVerified(unittest.TestCase):
+
+    def test_verified_members_read_in_chunks(self):
+        contents = [
+            b'short',
+            b''.join([uuid.UUID(int=random.Random(i).getrandbits(128), version=4).hex.encode()
+                      for i in range(0, 5000)]),
+        ]
+
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2):
+            for content in contents:
+                for spool_size in (1024, 1024 * 1024):
+                    with self.subTest(method=method, size=len(content), spool_size=spool_size):
+                        data = make_zip_bytes([('first.txt', content), ('second.txt', content)], method)
+                        results = []
+                        with tempfile.TemporaryDirectory() as tmp_dir:
+                            rollover_dirs = []
+                            original_temporary_file = tempfile.TemporaryFile
+
+                            def spy_temporary_file(*args, **kwargs):
+                                rollover_dirs.append(kwargs.get('dir'))
+                                return original_temporary_file(*args, **kwargs)
+
+                            tempfile.TemporaryFile = spy_temporary_file
+                            try:
+                                iterator = stream_unzip_verified(
+                                    single_byte_chunks(data), spool_size=spool_size, tmp_dir=tmp_dir
+                                )
+                                for name, size, readable in iterator:
+                                    self.assertEqual(size, len(content))
+                                    self.assertIsNotNone(readable)
+
+                                    pieces = []
+                                    while True:
+                                        piece = readable.read(123)
+                                        if not piece:
+                                            break
+                                        pieces.append(piece)
+                                    self.assertEqual(b''.join(pieces), content)
+                                    readable.close()
+                                    results.append(name)
+                            finally:
+                                tempfile.TemporaryFile = original_temporary_file
+
+                            if len(content) > spool_size:
+                                # Rolled over once per oversized member, into the
+                                # caller-permitted temporary location
+                                self.assertEqual(rollover_dirs, [tmp_dir, tmp_dir])
+                            else:
+                                self.assertEqual(rollover_dirs, [])
+
+                            self.assertEqual(results[-2:], [b'first.txt', b'second.txt'])
+                            self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_verified_tail_crc_failure_delivers_nothing(self):
+        content = b''.join([uuid.UUID(int=i, version=4).hex.encode() for i in range(0, 2000)])
+        data = make_zip_bytes([('only.txt', content)], zipfile.ZIP_STORED)
+
+        # Corrupt the high byte of the CRC32 in the local file header:
+        # the error is only detected after all the plaintext has streamed past
+        self.assertNotEqual(data[16], 0)
+        corrupt = data[0:16] + bytes([0]) + data[17:]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delivered = []
+            with self.assertRaises(CRC32IntegrityError):
+                for name, size, readable in stream_unzip_verified(
+                    single_byte_chunks(corrupt), spool_size=0, tmp_dir=tmp_dir
+                ):
+                    delivered.append((name, readable.read()))
+                    readable.close()
+
+            self.assertEqual(delivered, [])
+            self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_verified_tail_crc_failure_in_second_member(self):
+        # First member is valid and delivered; the corrupt member's plaintext
+        # must never be handed to the caller, and iteration stops there.
+        data = make_zip_bytes([
+            ('good.txt', b'good content'),
+            ('bad.txt', b'content that will fail its crc'),
+        ], zipfile.ZIP_STORED)
+
+        # Local header is a 4 byte signature plus a 26 byte struct, then the
+        # name and the stored data; the CRC32 starts 14 bytes into the header
+        second_offset = 30 + len(b'good.txt') + len(b'good content')
+        self.assertEqual(data[second_offset:second_offset + 4], b'PK\x03\x04')
+        crc_offset = second_offset + 14
+        corrupt = data[0:crc_offset] + bytes([data[crc_offset] ^ 0xFF]) + data[crc_offset + 1:]
+
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(CRC32IntegrityError):
+                for name, size, readable in stream_unzip_verified(
+                    single_byte_chunks(corrupt), spool_size=0, tmp_dir=tmp_dir
+                ):
+                    seen.append((name, readable.read()))
+                    readable.close()
+
+            self.assertEqual(seen, [(b'good.txt', b'good content')])
+            self.assertEqual(os.listdir(tmp_dir), [])
+            self.assertNotIn(b'content that will fail its crc',
+                             b''.join(name + body for name, body in seen))
+
+    def test_verified_tail_hmac_failure_delivers_nothing(self):
+        def yield_input():
+            with open('fixtures/7za_17_4_aes.zip', 'rb') as f:
+                data = f.read()
+                # Same corruption as the low-latency mode's bad HMAC test: the
+                # HMAC is at the tail of the member
+                yield data[0:130] + b'-' + data[132:]
+
+        delivered = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(HMACIntegrityError):
+                for name, size, readable in stream_unzip_verified(
+                    yield_input(), password=b'password', spool_size=0, tmp_dir=tmp_dir
+                ):
+                    delivered.append(readable.read())
+                    readable.close()
+
+            self.assertEqual(delivered, [])
+            self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_verified_valid_aes_member(self):
+        def yield_input():
+            with open('fixtures/7za_17_4_aes.zip', 'rb') as f:
+                yield f.read()
+
+        expected = b'Some content to be compressed and AES-encrypted\n' * 8
+        results = []
+        for name, size, readable in stream_unzip_verified(yield_input(), password=b'password'):
+            self.assertEqual(size, 384)
+            results.append((name, readable.read()))
+            readable.close()
+
+        self.assertEqual(results, [(b'content.txt', expected)])
+
+    def test_verified_max_uncompressed_size(self):
+        data = make_zip_bytes([('small.txt', b'abcd'), ('big.txt', b'x' * 100)])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(UncompressedSizeLimitError):
+                for name, size, readable in stream_unzip_verified(
+                    single_byte_chunks(data), max_uncompressed_size=50, tmp_dir=tmp_dir
+                ):
+                    readable.close()
+            self.assertEqual(os.listdir(tmp_dir), [])
+
+        # Members at or under the limit are delivered
+        for name, size, readable in stream_unzip_verified(
+            single_byte_chunks(data), max_uncompressed_size=100
+        ):
+            readable.close()
+
+    def test_verified_size_limit_unknown_member_size_enforced_during_reading(self):
+        # Members that use a data descriptor have an unknown size in their local
+        # header (stream_unzip yields file_size None), so the limit cannot be
+        # checked up front and must be enforced while verified bytes accumulate
+        import zlib as _zlib
+        from struct import Struct
+
+        member_name = b'big.txt'
+        content = b'y' * 100
+        crc = _zlib.crc32(content) & 0xFFFFFFFF
+        dobj = _zlib.compressobj(wbits=-_zlib.MAX_WBITS)
+        compressed = dobj.compress(content) + dobj.flush()
+
+        lfh = Struct('<IHHHHHIIIHH').pack(
+            0x04034b50, 20, 0x08, 8, 0, 0, 0, 0, 0, len(member_name), 0
+        ) + member_name
+        descriptor = Struct('<IIII').pack(0x08074b50, crc, len(compressed), len(content))
+        cdh = Struct('<IHHHHHHIIIHHHHHII').pack(
+            0x02014b50, 20, 20, 0x08, 8, 0, 0, crc,
+            len(compressed), len(content), len(member_name), 0, 0, 0, 0, 0, 0
+        ) + member_name
+        eocd = Struct('<IHHHHIIH').pack(
+            0x06054b50, 0, 0, 1, 1, len(cdh),
+            len(lfh) + len(compressed) + len(descriptor), 0
+        )
+        data = lfh + compressed + descriptor + cdh + eocd
+
+        with self.assertRaises(UncompressedSizeLimitError):
+            for _, size, readable in stream_unzip_verified(
+                single_byte_chunks(data), max_uncompressed_size=10
+            ):
+                self.assertIsNone(size)
+                readable.close()
+
+        # The same member is fine with a limit at its full size
+        for _, size, readable in stream_unzip_verified(
+            single_byte_chunks(data), max_uncompressed_size=100
+        ):
+            self.assertIsNone(size)
+            self.assertEqual(readable.read(), content)
+            readable.close()
+
+    def test_verified_undelivered_content_cleaned_on_early_stop(self):
+        closed = []
+
+        def yield_input():
+            data = make_zip_bytes([
+                ('first.txt', b'first'),
+                ('second.txt', b'second'),
+                ('third.txt', b'third'),
+            ])
+            try:
+                yield data
+            except GeneratorExit:
+                closed.append(True)
+                raise
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for name, size, readable in stream_unzip_verified(
+                yield_input(), spool_size=0, tmp_dir=tmp_dir
+            ):
+                self.assertEqual(readable.read(), b'first')
+                readable.close()
+                break
+
+            self.assertEqual(closed, [True])
+            self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_verified_invalid_arguments(self):
+        with self.assertRaises(UnzipValueError):
+            list(stream_unzip_verified(iter([]), max_uncompressed_size=-1))
+        with self.assertRaises(UnzipValueError):
+            list(stream_unzip_verified(iter([]), spool_size=-1))
+
+
+class TestAsyncStreamUnzipVerified(unittest.TestCase):
+
+    def test_async_verified_members_read_in_chunks(self):
+        content = b'-' * 100000
+        data = make_zip_bytes([('first.txt', content), ('second.txt', b'*' * 5)])
+        handles = []
+
+        async def async_bytes():
+            for i in range(0, len(data), 100):
+                yield data[i:i + 100]
+
+        async def test():
+            async for name, size, readable in async_stream_unzip_verified(
+                async_bytes(), spool_size=1024
+            ):
+                handles.append(readable)
+                pieces = b''
+                while True:
+                    piece = readable.read(4096)
+                    if not piece:
+                        break
+                    pieces += piece
+                if name == b'first.txt':
+                    self.assertEqual(size, len(content))
+                    self.assertEqual(pieces, content)
+                else:
+                    self.assertEqual(pieces, b'*' * 5)
+                readable.close()
+
+        asyncio.get_event_loop().run_until_complete(test())
+
+    def test_async_verified_tail_crc_failure_propagates(self):
+        content = b''.join([uuid.UUID(int=i, version=4).hex.encode() for i in range(0, 2000)])
+        data = make_zip_bytes([('only.txt', content)], zipfile.ZIP_STORED)
+        corrupt = data[0:16] + bytes([0]) + data[17:]
+
+        async def async_bytes():
+            yield corrupt
+
+        async def test():
+            async for name, size, readable in async_stream_unzip_verified(
+                async_bytes(), spool_size=0
+            ):
+                readable.close()
+
+        with self.assertRaises(CRC32IntegrityError):
+            asyncio.get_event_loop().run_until_complete(test())

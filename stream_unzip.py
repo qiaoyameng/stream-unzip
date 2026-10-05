@@ -2,6 +2,7 @@ from functools import partial
 from struct import Struct
 import asyncio
 import bz2
+import tempfile
 import zlib
 
 from Crypto.Cipher import AES
@@ -464,8 +465,77 @@ def stream_unzip(zipfile_chunks, password=None, chunk_size=65536, allow_zip64=Tr
             raise UnfinishedIterationError()
 
 
-async def async_stream_unzip(chunks, *args, **kwargs):
+def stream_unzip_verified(
+    zipfile_chunks,
+    password=None,
+    chunk_size=65536,
+    allow_zip64=True,
+    max_uncompressed_size=None,
+    spool_size=1024 * 1024,
+    tmp_dir=None,
+):
+    """Yield members only after their full decompression and integrity verification.
 
+    Unlike ``stream_unzip``, no bytes of a member are exposed to the caller
+    until the member has been fully read: its CRC32, or its AES HMAC, and its
+    sizes have all been checked. Members that fail these checks are never
+    yielded, so their plaintext cannot leak to callers.
+
+    Small members are kept in memory. Members larger than ``spool_size`` are
+    transparently rolled over to a temporary file in ``tmp_dir`` (the
+    operating system's default temporary directory if ``None``).
+
+    ``max_uncompressed_size`` bounds the number of decompressed bytes of any
+    single member; ``UncompressedSizeLimitError`` is raised (and the partial
+    member cleaned up) if it is exceeded.
+
+    Each yielded item is a tuple of the file name, the file size, and a
+    readable binary file-like object positioned at the start of the verified
+    bytes. The caller owns this object and must close it; closing it also
+    deletes any underlying temporary file. Objects of members that fail
+    verification, or that are not otherwise delivered, are closed and deleted
+    automatically - including if the outer iteration is stopped early.
+    """
+    if max_uncompressed_size is not None and max_uncompressed_size < 0:
+        raise UnzipValueError('max_uncompressed_size must be non-negative')
+    if spool_size < 0:
+        raise UnzipValueError('spool_size must be non-negative')
+
+    members = stream_unzip(
+        zipfile_chunks,
+        password=password,
+        chunk_size=chunk_size,
+        allow_zip64=allow_zip64,
+    )
+
+    for file_name, file_size, unzipped_chunks in members:
+        if (
+            max_uncompressed_size is not None
+            and file_size is not None
+            and file_size > max_uncompressed_size
+        ):
+            raise UncompressedSizeLimitError(file_size, max_uncompressed_size)
+
+        spooled = tempfile.SpooledTemporaryFile(max_size=spool_size, dir=tmp_dir)
+        total = 0
+        try:
+            for chunk in unzipped_chunks:
+                total += len(chunk)
+                if (
+                    max_uncompressed_size is not None
+                    and total > max_uncompressed_size
+                ):
+                    raise UncompressedSizeLimitError(total, max_uncompressed_size)
+                spooled.write(chunk)
+        except BaseException:
+            spooled.close()
+            raise
+
+        spooled.seek(0)
+        yield file_name, file_size, spooled
+
+
+async def async_stream_unzip(chunks, *args, **kwargs):
     async def to_async_iterable(sync_iterable):
         # asyncio.to_thread is not available until Python 3.9, and StopIteration doesn't get
         # propagated by run_in_executor, so we use a sentinel to detect the end of the iterable
@@ -503,8 +573,56 @@ async def async_stream_unzip(chunks, *args, **kwargs):
         loop = asyncio.get_event_loop()
     unzipped_chunks = stream_unzip(to_sync_iterable(chunks), *args, **kwargs)
 
-    async for name, size, chunks in to_async_iterable(unzipped_chunks):
-        yield name, size, to_async_iterable(chunks)
+    async for name, size, member_chunks in to_async_iterable(unzipped_chunks):
+        yield name, size, to_async_iterable(member_chunks)
+
+
+async def async_stream_unzip_verified(chunks, *args, **kwargs):
+    """Async counterpart of ``stream_unzip_verified``.
+
+    Each member is yielded only after it has been fully decompressed and its
+    integrity checks passed. The third item of each tuple is a readable binary
+    file-like object, which the caller must close.
+    """
+    async def to_async_iterable(sync_iterable):
+        # asyncio.to_thread is not available until Python 3.9, and StopIteration doesn't get
+        # propagated by run_in_executor, so we use a sentinel to detect the end of the iterable
+        done = object()
+        it = iter(sync_iterable)
+
+        # contextvars are not available until Python 3.7
+        try:
+            import contextvars
+        except ImportError:
+            get_args = lambda: (next, it, done)
+        else:
+            get_args = lambda: (contextvars.copy_context().run, next, it, done)
+
+        while True:
+            value = await loop.run_in_executor(None, *get_args())
+            if value is done:
+                break
+            yield value
+
+    def to_sync_iterable(async_iterable):
+        # The built-in aiter and anext functions are not available until Python 3.10
+        async_it = async_iterable.__aiter__()
+        while True:
+            try:
+                value = asyncio.run_coroutine_threadsafe(async_it.__anext__(), loop).result()
+            except StopAsyncIteration:
+                break
+            yield value
+
+    # get_running_loop is preferred, but isn't available until Python 3.7
+    try:
+        loop = asyncio.get_running_loop()
+    except:
+        loop = asyncio.get_event_loop()
+    verified_members = stream_unzip_verified(to_sync_iterable(chunks), *args, **kwargs)
+
+    async for member in to_async_iterable(verified_members):
+        yield member
 
 
 class UnzipError(Exception):
@@ -608,3 +726,11 @@ class IncorrectZipCryptoPasswordError(IncorrectPasswordError):
 
 class IncorrectAESPasswordError(IncorrectPasswordError):
     pass
+
+class UncompressedSizeLimitError(UnzipError):
+    def __init__(self, actual_size, max_size):
+        self.actual_size = actual_size
+        self.max_size = max_size
+        super().__init__(
+            'Uncompressed member size {0} exceeds the limit of {1}'.format(actual_size, max_size)
+        )

@@ -1,0 +1,7 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/zhihe001/.local/share/pair-wise-gsb/workspaces/gsb-20261005-python200-ready25-04/GSB-PY200-20261005-ZU02/B
+configfile: pyproject.toml
+collected 53 items / 51 deselected / 2 selected
+
+test.py 
